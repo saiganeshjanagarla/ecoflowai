@@ -120,3 +120,44 @@ test('incident workflow creates a reviewed and assigned case', () => {
     restore();
   }
 });
+
+test('agent loop validates tool actions and falls back to the local rule engine when LLM is unavailable', async () => {
+  const restore = resetState();
+  const previousProvider = process.env.LLM_PROVIDER;
+  const previousKey = process.env.OPENAI_API_KEY || process.env.LLM_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.LLM_API_KEY;
+  process.env.LLM_PROVIDER = 'openai';
+
+  try {
+    const run = await agent.runAgentLoop({ trigger: 'chat', prompt: 'Which bins are critical right now?', user: { role: 'ADMIN' } });
+    assert.equal(run.mode, 'LOCAL_RULE_ENGINE');
+    assert.ok(Array.isArray(run.decisions));
+    assert.ok(run.decisions.length > 0);
+    assert.throws(() => agent.executeToolAction({ tool: 'predict_overflow', args: { binId: 'INVALID-BIN' } }), /not found/i);
+  } finally {
+    restore();
+    if (previousProvider === undefined) delete process.env.LLM_PROVIDER; else process.env.LLM_PROVIDER = previousProvider;
+    if (previousKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previousKey;
+  }
+});
+
+test('read-only agent prompts do not create collection tasks', async () => {
+  const restore = resetState();
+  const previousProvider = process.env.LLM_PROVIDER;
+  const previousKey = process.env.OPENAI_API_KEY || process.env.LLM_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.LLM_API_KEY;
+  process.env.LLM_PROVIDER = 'openai';
+
+  try {
+    const taskCount = store.tasks.length;
+    const run = await agent.runAgentLoop({ trigger: 'chat', prompt: 'Which bins are critical right now?', user: { role: 'ADMIN' } });
+    assert.equal(store.tasks.length, taskCount);
+    assert.equal(run.actions[0].type, 'READ_ONLY');
+  } finally {
+    restore();
+    if (previousProvider === undefined) delete process.env.LLM_PROVIDER; else process.env.LLM_PROVIDER = previousProvider;
+    if (previousKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previousKey;
+  }
+});

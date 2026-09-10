@@ -126,6 +126,18 @@ app.delete('/api/users/:id', requireAuth, requirePermission('users.delete'), (re
   res.json({ success: true, id: req.params.id });
 });
 app.get('/api/dashboard', requireAuth, (req, res) => res.json(getDashboardState(req.user.workspace || req.query.workspace || 'Hyderabad Operations', req.user)));
+app.get('/api/map', requireAuth, (req, res) => {
+  const workspaceName = req.user.workspace || req.query.workspace || 'Hyderabad Operations';
+  const payload = {
+    bins: agent.getWorkspaceBins(workspaceName),
+    vehicles: store.vehicles,
+    tasks: store.tasks,
+    routes: store.routes,
+    alerts: store.incidents,
+    center: { latitude: 17.3850, longitude: 78.4867 }
+  };
+  res.json({ success: true, message: 'Hyderabad map data loaded', data: payload, ...payload });
+});
 app.get('/api/bins', requireAuth, requirePermission('bins.read'), (req, res) => res.json(agent.getWorkspaceBins(req.user.workspace || req.query.workspace || 'Hyderabad Operations')));
 app.post('/api/bins', requireAuth, requirePermission('bins.create'), (req, res) => {
   const schema = z.object({ id: z.string().regex(/^(HYG|B)-\d{3,}$/), location: z.string().min(1), wasteType: z.string().min(1), capacity: z.number().positive(), latitude: z.number(), longitude: z.number() });
@@ -261,9 +273,43 @@ app.delete('/api/locations/:id', requireAuth, requirePermission('locations.delet
   const [location] = store.locations.splice(index, 1);
   res.json({ success: true, id: location.id });
 });
+app.get('/api/tasks', requireAuth, requirePermission('tasks.read'), (req, res) => {
+  const tasks = req.user.role === ROLES.OPERATOR ? store.tasks.filter(task => task.assigneeId === req.user.sub) : store.tasks;
+  res.json(tasks);
+});
 app.get('/api/collections', requireAuth, requirePermission('tasks.read'), (req, res) => {
   const tasks = req.user.role === ROLES.OPERATOR ? store.tasks.filter(task => task.assigneeId === req.user.sub) : store.tasks;
   res.json(tasks);
+});
+app.post('/api/tasks', requireAuth, requirePermission('tasks.create'), (req, res) => {
+  const schema = z.object({
+    bins: z.array(z.string().min(1)).min(1),
+    vehicleId: z.string().min(1),
+    source: z.enum(['AI', 'MANUAL']).default('MANUAL'),
+    priority: z.enum(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']).default('HIGH'),
+    reason: z.string().min(1).max(500).default('Manual collection task created')
+  });
+
+  const parsed = schema.safeParse(req.body || {});
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid collection task payload', details: parsed.error.flatten() });
+
+  const { bins, vehicleId, source, priority, reason } = parsed.data;
+  const vehicle = store.vehicles.find(item => item.id === vehicleId);
+  if (!vehicle) return res.status(404).json({ error: 'Vehicle not found' });
+
+  try {
+    const assigneeId = req.body.assigneeId || null;
+    if (req.user.role === ROLES.OPERATOR && assigneeId && assigneeId !== req.user.sub) return res.status(403).json({ error: 'Operators can only assign tasks to themselves' });
+    if (assigneeId) {
+      const assignee = findUser(assigneeId);
+      if (!assignee || assignee.role !== ROLES.OPERATOR || assignee.status !== 'ACTIVE') return res.status(400).json({ error: 'An active operator is required' });
+    }
+    const task = agent.createCollectionTask({ bins, vehicleId, source, priority, reason, assigneeId });
+    store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: 'Created collection task', resource: 'task', resourceId: task.id, timestamp: new Date().toISOString(), metadata: { assigneeId, bins } });
+    res.status(201).json({ success: true, data: task, message: 'Collection task created', ...task });
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
 });
 app.post('/api/collections', requireAuth, requirePermission('tasks.create'), (req, res) => {
   const schema = z.object({
@@ -294,6 +340,12 @@ app.post('/api/collections', requireAuth, requirePermission('tasks.create'), (re
   } catch (error) {
     return res.status(400).json({ error: error.message });
   }
+});
+app.get('/api/tasks/:id', requireAuth, requirePermission('tasks.read'), (req, res) => {
+  const task = store.tasks.find(item => item.id === req.params.id);
+  if (!task) return res.status(404).json({ error: 'Collection task not found' });
+  if (req.user.role === ROLES.OPERATOR && task.assigneeId !== req.user.sub) return res.status(403).json({ error: 'Task is not assigned to you' });
+  res.json({ success: true, data: task, message: 'Task loaded', ...task });
 });
 app.get('/api/collections/:id', requireAuth, requirePermission('tasks.read'), (req, res) => {
   const task = store.tasks.find(item => item.id === req.params.id);
@@ -370,6 +422,23 @@ app.patch('/api/drivers/:id', requireAuth, requirePermission('drivers.update'), 
   res.json(driver);
 });
 app.get('/api/agents', requireAuth, requirePermission('agents.read'), (_, res) => res.json(store.agents));
+app.post('/api/agents/route-optimize', requireAuth, requireRole('ADMIN'), (_, res) => {
+  const run = agent.runOptimization('manual');
+  res.status(201).json({ success: true, message: 'Route optimization completed', data: run, ...run });
+});
+app.post('/api/agents/overflow-predict', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
+  const binId = String(req.body?.binId || '').trim();
+  const bins = agent.getBinStatus();
+  const predictions = binId ? bins.filter(bin => bin.id === binId) : bins.filter(bin => ['CRITICAL', 'HIGH', 'MEDIUM'].includes(bin.priority));
+  res.json({ success: true, message: 'Overflow predictions loaded', data: predictions, predictions });
+});
+app.post('/api/agents/dispatch', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
+  const payload = req.body || {};
+  const selectedBins = Array.isArray(payload.bins) && payload.bins.length ? payload.bins : ['HYG-001'];
+  const vehicleId = payload.vehicleId || agent.getAvailableVehiclesForBins(selectedBins.map(id => ({ id }))).find(Boolean)?.id || store.vehicles[0]?.id;
+  const task = agent.createCollectionTask({ bins: selectedBins, vehicleId, source: payload.source || 'AI', priority: payload.priority || 'HIGH', reason: payload.reason || 'Dispatch recommendation' });
+  res.status(201).json({ success: true, message: 'Dispatch generated', data: task, ...task });
+});
 app.get('/api/agents/activity', requireAuth, requirePermission('agents.read'), (_, res) => res.json(store.auditLogs.filter(log => ['task', 'vehicle', 'alert', 'agent'].includes(log.resource)).slice(0, 20)));
 app.get('/api/settings', requireAuth, requirePermission('settings.read'), (_, res) => res.json(store.settings));
 app.patch('/api/settings', requireAuth, requirePermission('settings.manage'), (req, res) => {
@@ -385,115 +454,32 @@ app.post('/api/settings/reset', requireAuth, requirePermission('settings.manage'
   store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: _.user.email, role: _.user.role, action: 'Settings reset', resource: 'settings', resourceId: 'SYSTEM', timestamp: new Date().toISOString(), metadata: {} });
   res.json(store.settings);
 });
-app.get('/api/analytics', requireAuth, requirePermission('analytics.read'), (req, res) => res.json(getDashboardState(req.user.workspace || 'Hyderabad Operations', req.user)));
+app.get('/api/analytics', requireAuth, requirePermission('analytics.read'), (req, res) => {
+  const payload = getDashboardState(req.user.workspace || 'Hyderabad Operations', req.user);
+  res.json({ success: true, message: 'Analytics loaded', data: payload, ...payload });
+});
 app.get('/api/reports', requireAuth, requirePermission('reports.read'), (req, res) => res.json({ generatedAt: new Date().toISOString(), metrics: getDashboardState(req.user.workspace || 'Hyderabad Operations', req.user).metrics, tasks: req.user.role === ROLES.OPERATOR ? store.tasks.filter(task => task.assigneeId === req.user.sub) : store.tasks }));
-app.get('/api/ai/status', requireAuth, (_, res) => res.json({ online: true, mode: process.env.LLM_API_KEY ? 'LLM' : 'LOCAL_RULE_ENGINE', lastRun: store.aiRuns[0] || null, nextRun: null, scheduler: false }));
+app.get('/api/ai/status', requireAuth, (_, res) => res.json({ online: true, mode: process.env.OPENAI_API_KEY || process.env.LLM_API_KEY ? 'LLM' : 'LOCAL_RULE_ENGINE', lastRun: store.aiRuns[0] || null, nextRun: null, scheduler: false }));
 app.get('/api/ai/runs', requireAuth, requirePermission('analytics.read'), (_, res) => res.json(store.aiRuns));
-app.post('/api/ai/run', requireAuth, requireRole('ADMIN'), (_, res) => res.status(201).json(agent.runOptimization('manual')));
-app.post('/api/agent/query', requireAuth, (req, res) => {
-  const query = String(req.body?.query || '').toLowerCase();
-  const bins = agent.getBinStatus();
-  const criticalBins = bins.filter(bin => ['CRITICAL', 'HIGH'].includes(bin.priority));
-  const binMatch = query.match(/b-\d{3}/i);
-  const normalizedBinMatch = query.match(/(?:hyg|b)-\d{3}/i);
+app.post('/api/ai/run', requireAuth, requireRole('ADMIN'), async (_, res) => {
+  const run = await agent.runAgentLoop({ trigger: 'manual', prompt: 'Assess Hyderabad operations and execute the next validated action.', user: _.user });
+  res.status(201).json(run);
+});
+app.post('/api/agent/query', requireAuth, async (req, res) => {
+  const query = String(req.body?.query || '').trim();
+  if (!query) return res.status(400).json({ error: 'Ask a question or give the operations agent a command.' });
 
-  if (!query.trim()) return res.status(400).json({ error: 'Ask a question or give the operations agent a command.' });
-
-  if (query.includes('create') && (query.includes('task') || query.includes('collection'))) {
-    if (req.user.role === ROLES.VIEWER) return res.status(403).json({ error: 'Viewers cannot create collection tasks.' });
-    const requestedBin = normalizedBinMatch?.[0]?.toUpperCase() || criticalBins[0]?.id;
-    const selectedBin = bins.find(bin => bin.id.toLowerCase() === requestedBin?.toLowerCase());
-    if (!selectedBin) return res.status(404).json({ error: 'Mention a valid Hyderabad bin such as HYG-001.' });
-    const vehicleMatch = query.match(/v-\d{2}/i);
-    const vehicle = vehicleMatch ? store.vehicles.find(item => item.id.toLowerCase() === vehicleMatch[0].toLowerCase()) : agent.getAvailableVehiclesForBins([selectedBin])[0];
-    if (!vehicle) return res.status(409).json({ error: 'No available vehicle can handle this collection.' });
-    if (vehicle.status === 'MAINTENANCE' || vehicle.status === 'OFFLINE') return res.status(409).json({ error: `${vehicle.id} is not available for dispatch.` });
-    const operatorMatch = query.match(/(?:assign(?:ed)? to|operator)\s+([a-z ]+?)(?=\s+(?:for|on|with|using|vehicle|v-\d{2})|$)/i);
-    const operator = operatorMatch && [...require('./auth').users].find(user => user.role === ROLES.OPERATOR && user.name.toLowerCase() === operatorMatch[1].trim().toLowerCase());
-    const assigneeId = operator?.id || (req.user.role === ROLES.OPERATOR ? req.user.sub : null);
-    if (operatorMatch && !operator) return res.status(404).json({ error: `No active operator named ${operatorMatch[1].trim()} was found.` });
-    const priority = query.includes('critical') ? 'CRITICAL' : query.includes('medium') ? 'MEDIUM' : query.includes('low') ? 'LOW' : selectedBin.priority === 'CRITICAL' ? 'CRITICAL' : 'HIGH';
-    try {
-      const task = agent.createCollectionTask({ bins: [selectedBin.id], vehicleId: vehicle.id, source: 'MANUAL', priority, reason: `Created by ${req.user.name} through the operations assistant.`, assigneeId });
-      if (assigneeId) { task.status = 'ASSIGNED'; task.driver = require('./auth').findUser(assigneeId).name; }
-      store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: 'Created collection task via assistant', resource: 'task', resourceId: task.id, timestamp: new Date().toISOString(), metadata: { binId: selectedBin.id, vehicleId: vehicle.id, assigneeId } });
-      return res.status(201).json({ answer: `Created ${task.id} for ${selectedBin.id} in ${selectedBin.location}. ${vehicle.id} is assigned${task.driver ? ` to ${task.driver}` : ''}.`, task, refresh: true, engine: 'Local Operations Assistant' });
-    } catch (error) { return res.status(400).json({ error: error.message }); }
-  }
-
-  const taskMatch = query.match(/(?:task|collection)\s+(ct-\d{3,6})/i);
-  if ((query.includes('complete') || query.includes('finish') || query.includes('start') || query.includes('accept') || query.includes('advance')) && taskMatch) {
-    const task = store.tasks.find(item => item.id.toLowerCase() === taskMatch[1].toLowerCase());
-    if (!task) return res.status(404).json({ error: `${taskMatch[1].toUpperCase()} was not found.` });
-    if (req.user.role === ROLES.VIEWER) return res.status(403).json({ error: 'Viewers cannot change task status.' });
-    if (req.user.role === ROLES.OPERATOR && task.assigneeId !== req.user.sub) return res.status(403).json({ error: 'That task is not assigned to you.' });
-    const nextStatus = query.includes('complete') || query.includes('finish') ? 'COMPLETED' : task.status === 'PENDING' ? 'ASSIGNED' : task.status === 'ASSIGNED' ? 'EN_ROUTE' : task.status === 'EN_ROUTE' ? 'COLLECTING' : 'COMPLETED';
-    if (nextStatus === 'COMPLETED') agent.completeTask(task.id, { collectedQuantity: Number(task.bins.length * 120), notes: 'Completed through operations assistant', contaminationLevel: 'MEDIUM' });
-    else agent.transitionTask(task, nextStatus);
-    store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: `Changed task status to ${nextStatus} via assistant`, resource: 'task', resourceId: task.id, timestamp: new Date().toISOString(), metadata: {} });
-    return res.json({ answer: `${task.id} is now ${task.status}.`, task, refresh: true, engine: 'Local Operations Assistant' });
-  }
-
-  if (query.includes('report incident') || query.includes('incident')) {
-    if (req.user.role === ROLES.VIEWER) return res.status(403).json({ error: 'Viewers cannot report operational incidents.' });
-    const severity = query.includes('critical') ? 'CRITICAL' : query.includes('high') ? 'HIGH' : query.includes('low') ? 'LOW' : 'MEDIUM';
-    const wasteType = /organic|plastic|paper|glass|metal|mixed|food/i.exec(query)?.[0] || 'Mixed';
-    const location = /hitec city|madhapur|gachibowli|kondapur|kukatpally|jubilee hills|banjara hills|ameerpet|begumpet|secunderabad|mehdipatnam|lb nagar|uppal|dilsukhnagar|charminar|financial district/i.exec(query)?.[0] || 'Hyderabad Operations';
-    const incident = agent.reportIncident({
-      location: location.charAt(0).toUpperCase() + location.slice(1),
-      wasteType: wasteType.charAt(0).toUpperCase() + wasteType.slice(1),
-      severity,
-      description: `AI-generated incident report for ${wasteType} waste observed near ${location}.`,
-      reporter: req.user?.email || 'system@ecoflow.local'
-    });
-    return res.json({ answer: `Incident ${incident.id} has been logged and assigned for review.`, incident, engine: 'Local AI Decision Engine' });
-  }
-
-  if (query.includes('optimize') || query.includes('run today')) {
-    if (req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Only administrators can execute AI optimization.' });
-    return res.json({ answer: 'I started a verified optimization run using the live bin and vehicle state.', run: agent.runOptimization('chat') });
-  }
-
-  if (binMatch && (query.includes('why') || query.includes('critical') || query.includes('explain'))) {
-    const bin = bins.find(item => item.id.toLowerCase() === binMatch[0].toLowerCase());
-    if (!bin) return res.status(404).json({ error: `Bin ${binMatch[0].toUpperCase()} was not found.` });
+  try {
+    const result = await agent.runAgentLoop({ trigger: 'chat', prompt: query, user: req.user });
     return res.json({
-      answer: `${bin.id} is ${bin.priority.toLowerCase()} because it is ${bin.fill}% full and filling at ${bin.fillRate}% per hour. The local forecast estimates overflow in ${bin.forecast.hours} hours.`,
-      bin,
-      engine: 'Local AI Decision Engine'
+      answer: result.answer || 'The AI agent processed the latest Hyderabad operational state.',
+      run: result,
+      refresh: true,
+      engine: result.mode === 'LLM' ? 'OpenAI' : 'Local AI Decision Engine'
     });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Agent query failed.' });
   }
-
-  if (query.includes('which bins need collection') || query.includes('critical') || query.includes('need collection')) {
-    return res.json({
-      answer: `${criticalBins.length} bins need attention: ${criticalBins.map(bin => `${bin.id} (${bin.fill}%)`).join(', ') || 'none right now.'}`,
-      bins: criticalBins,
-      engine: 'Local AI Decision Engine'
-    });
-  }
-
-  if (query.includes('most urgent') || query.includes('urgent')) {
-    const urgent = [...bins].sort((a, b) => b.fill - a.fill)[0];
-    return res.json({ answer: `${urgent.id} is the most urgent bin at ${urgent.fill}% fill with a ${urgent.priority} priority.`, bin: urgent, engine: 'Local AI Decision Engine' });
-  }
-
-  if (query.includes('vehicle') && normalizedBinMatch) {
-    const bin = bins.find(item => item.id.toLowerCase() === normalizedBinMatch[0].toLowerCase());
-    if (!bin) return res.status(404).json({ error: `Bin ${normalizedBinMatch[0].toUpperCase()} was not found.` });
-    const vehicles = agent.getAvailableVehiclesForBins([bin]).filter(vehicle => vehicle.availableCapacity >= Math.max(0, bin.fill * 2));
-    return res.json({ answer: vehicles.length ? `${vehicles[0].id} is the best-fit vehicle with ${vehicles[0].availableCapacity} kg remaining capacity.` : 'No available vehicle has enough capacity for that bin.', vehicles, engine: 'Local AI Decision Engine' });
-  }
-
-  if (query.includes('waste') || query.includes('collected today')) {
-    const collected = store.tasks.filter(task => task.status === 'COMPLETED').reduce((sum, task) => sum + (task.collectedQuantity || 0), 0);
-    return res.json({ answer: `A total of ${collected} kg of waste has been collected today.`, collected, engine: 'Local AI Decision Engine' });
-  }
-
-  if (query.includes('available')) {
-    return res.json({ answer: `${store.vehicles.filter(vehicle => vehicle.status === 'AVAILABLE').length} vehicles are currently available.`, vehicles: store.vehicles.filter(vehicle => vehicle.status === 'AVAILABLE'), engine: 'Local AI Decision Engine' });
-  }
-
-  return res.json({ answer: 'I can answer live questions about urgent bins, vehicle readiness, route optimization, and current waste collection totals using the Local AI Decision Engine.', engine: 'Local AI Decision Engine' });
 });
 app.patch('/api/collections/:id', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
   const task = store.tasks.find(item => item.id === req.params.id);
@@ -536,7 +522,7 @@ app.patch('/api/alerts/:id/status', requireAuth, requireRole('ADMIN', 'OPERATOR'
     res.json(incident);
   } catch (error) { res.status(400).json({ error: error.message }); }
 });
-app.use((err, _, res, __) => res.status(500).json({ error: 'Unexpected server error', message: err.message }));
+app.use((err, _, res, __) => res.status(500).json({ success: false, error: 'Unexpected server error', message: err.message }));
 
 const server = app.listen(port, () => console.log(`EcoFlow API listening on http://localhost:${port}`));
 server.on('error', error => {

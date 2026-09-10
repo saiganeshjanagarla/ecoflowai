@@ -106,4 +106,81 @@ const readings = Array.from({ length: 14 }, (_, day) => ({
   day: `Day ${day + 1}`, total: 330 + ((day * 47) % 120), organic: 130 + ((day * 13) % 42), plastic: 72 + ((day * 7) % 25), recycled: 170 + ((day * 17) % 50)
 }));
 
-module.exports = { bins, vehicles, drivers, tasks, routes, locations: locationRecords, notifications, incidents, auditLogs, aiRuns, agents, settings, defaultSettings, readings, wasteTypes };
+const agentRuns = [];
+const agentDecisions = [];
+const agentTimeline = [];
+
+function resetDemoState() {
+  const sourceBins = Array.from({ length: 24 }, (_, index) => {
+    const [location, area, latitude, longitude] = locationSeeds[index % locationSeeds.length];
+    const fill = [96, 88, 76, 63, 42, 94, 71, 57, 82, 64, 90, 48, 79, 68, 54, 92, 73, 61, 87, 59, 66, 81, 95, 51][index % 24];
+    const rate = Number((1.2 + (index % 5) * 0.55).toFixed(1));
+    return {
+      id: `HYG-${String(index + 1).padStart(3, '0')}`,
+      name: `${location} Collection Point ${index + 1}`,
+      location,
+      area,
+      city: HYDERABAD.city,
+      state: HYDERABAD.state,
+      latitude,
+      longitude,
+      wasteType: wasteTypes[index % wasteTypes.length],
+      capacity: 240 + (index % 3) * 80,
+      fill,
+      fillRate: rate,
+      temperature: 24 + (index % 7),
+      battery: 78 + (index % 4) * 5,
+      lastCollected: new Date(Date.now() - (index + 1) * 3600000 * 4).toISOString(),
+      sensorStatus: index === 11 ? 'DEGRADED' : 'ONLINE',
+      priority: fill >= 95 ? 'CRITICAL' : fill >= 85 ? 'HIGH' : fill >= 70 ? 'MEDIUM' : 'LOW',
+      predictedOverflowTime: null,
+      status: fill >= 95 ? 'CRITICAL' : fill >= 85 ? 'HIGH' : fill >= 70 ? 'MEDIUM' : 'NORMAL',
+      workspace: HYDERABAD.workspace,
+      nextScheduledCollection: new Date(Date.now() + (index + 1) * 3600000).toISOString()
+    };
+  });
+
+  const sourceVehicles = Array.from({ length: 6 }, (_, index) => ({
+    id: `V-${String(index + 1).padStart(2, '0')}`,
+    registration: `TS-09-EF-${String(2400 + index)}`,
+    type: index % 2 ? 'Compactor' : 'Electric tipper',
+    capacity: 900 + (index % 3) * 300,
+    currentLoad: index === 1 ? 430 : index === 3 ? 240 : 0,
+    location: locationSeeds[index * 3 % locationSeeds.length][0],
+    driver: ['Raj Kumar', 'Ananya Rao', 'Vikram Reddy', 'Priya Nair', 'Arjun Das', 'Sana Ali'][index],
+    status: index === 1 ? 'ASSIGNED' : index === 4 ? 'MAINTENANCE' : 'AVAILABLE',
+    fuelLevel: 74 + index * 6,
+    lastService: new Date(Date.now() - (index + 1) * 86400000 * 8).toISOString()
+  }));
+
+  const sourceTasks = [
+    { id: 'CT-1048', priority: 'HIGH', source: 'AI', bins: ['HYG-002', 'HYG-003'], vehicle: 'V-02', driver: 'Ananya Rao', assigneeId: 'U-002', routeId: 'HYD-RT-002', distance: 5.8, duration: 32, status: 'IN_PROGRESS', reason: 'HYG-002 in HITEC City is predicted to overflow in 2h 10m.', createdAt: new Date().toISOString(), collectedQuantity: 0, notes: '', contaminationLevel: 'MEDIUM' },
+    { id: 'CT-1047', priority: 'MEDIUM', source: 'MANUAL', bins: ['HYG-005'], vehicle: 'V-01', driver: 'Raj Kumar', assigneeId: 'U-002', routeId: 'HYD-RT-003', distance: 3.2, duration: 18, status: 'COMPLETED', reason: 'Scheduled Kukatpally collection.', createdAt: new Date().toISOString(), collectedQuantity: 260, notes: 'Routine collection', contaminationLevel: 'LOW' },
+    { id: 'CT-1046', priority: 'CRITICAL', source: 'AI', bins: ['HYG-008'], vehicle: 'V-04', driver: 'Priya Nair', assigneeId: 'U-002', routeId: 'HYD-RT-004', distance: 7.1, duration: 41, status: 'PENDING', reason: 'HYG-008 in Banjara Hills is at 96% capacity.', createdAt: new Date().toISOString(), collectedQuantity: 0, notes: '', contaminationLevel: 'MEDIUM' }
+  ];
+
+  const sourceIncidents = [
+    { id: 'INC-1001', type: 'PREDICTED_OVERFLOW', location: 'Gachibowli', severity: 'HIGH', description: 'HYG-001 is forecast to reach overflow capacity within two hours.', relatedBinId: 'HYG-001', status: 'OPEN', reportedAt: new Date(Date.now() - 8 * 60000).toISOString(), aiReview: 'LOCAL_RULE_ENGINE' },
+    { id: 'INC-1002', type: 'VEHICLE_ISSUE', location: 'Uppal', severity: 'MEDIUM', description: 'V-05 is unavailable pending scheduled maintenance inspection.', relatedVehicleId: 'V-05', status: 'ACKNOWLEDGED', reportedAt: new Date(Date.now() - 3600000).toISOString(), aiReview: null }
+  ];
+
+  const sourceNotifications = [
+    { id: 'N-1', type: 'OVERFLOW_WARNING', title: 'Overflow risk detected', body: 'HYG-001 in Gachibowli may overflow in 1h 42m.', time: '8 min ago', read: false },
+    { id: 'N-2', type: 'AI_RECOMMENDATION', title: 'Hyderabad route optimized', body: 'Combining Madhapur and HITEC City stops saves 2.4 km.', time: '22 min ago', read: false },
+    { id: 'N-3', type: 'VEHICLE_ISSUE', title: 'Vehicle V-05 maintenance', body: 'Vehicle unavailable until inspection is complete.', time: '1 hr ago', read: true }
+  ];
+
+  bins.splice(0, bins.length, ...sourceBins);
+  vehicles.splice(0, vehicles.length, ...sourceVehicles);
+  tasks.splice(0, tasks.length, ...sourceTasks);
+  incidents.splice(0, incidents.length, ...sourceIncidents);
+  notifications.splice(0, notifications.length, ...sourceNotifications);
+  auditLogs.splice(0, auditLogs.length, ...[]);
+  aiRuns.splice(0, aiRuns.length, ...[]);
+  agentRuns.splice(0, agentRuns.length, ...[]);
+  agentDecisions.splice(0, agentDecisions.length, ...[]);
+  agentTimeline.splice(0, agentTimeline.length, ...[]);
+  routes.splice(0, routes.length, ...routeSeeds.map(([id, name], index) => ({ id, name, bins: tasks[index % tasks.length].bins, operatorId: 'U-002', vehicleId: `V-${String((index % 6) + 1).padStart(2, '0')}`, status: index === 1 ? 'IN_PROGRESS' : 'PLANNED', distance: 8 + index * 1.7, createdAt: new Date().toISOString(), stops: name.split(' → ') })));
+}
+
+module.exports = { bins, vehicles, drivers, tasks, routes, locations: locationRecords, notifications, incidents, auditLogs, aiRuns, agentRuns, agentDecisions, agentTimeline, agents, settings, defaultSettings, readings, wasteTypes, resetDemoState };
