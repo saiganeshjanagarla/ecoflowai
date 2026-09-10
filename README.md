@@ -26,11 +26,14 @@ npm.cmd run build
 ## Demo flow
 
 1. Open Overview and inspect live Hyderabad bins, fleet state, metrics, charts, and the operations queue.
-2. Click **Run AI optimization**. The API runs the local rule engine against current bin and vehicle data.
-3. Open **AI Command Center** to see the verified action trace.
-4. Observe the new collection task, assigned vehicle, operator notification, and audit event through the API.
+2. The backend automatically runs optimization on startup and every five minutes, creating verified collection tasks for urgent bins with available vehicles.
+3. Click **Run AI optimization** to trigger an additional immediate run when needed.
+4. Open **AI Command Center** to see the verified action trace.
+5. Observe the new collection task, assigned vehicle, operator notification, and audit event through the API.
 
-The local rule engine is intentional: no LLM key is required and the UI labels the active mode. `LLM_API_KEY` is reserved for adding a provider adapter without making the operational workflow depend on an external service.
+Automation can be configured with `AI_AUTOMATION_INTERVAL_MS` (minimum 60000 milliseconds) or disabled with `AI_AUTOMATION_ENABLED=false`.
+
+When `OPENAI_API_KEY` or `LLM_API_KEY` is configured in `backend/.env`, the backend uses the provider for reasoning and tool selection. The key is never sent to the frontend. OpenAI keys use the OpenAI Chat Completions endpoint; OpenRouter-compatible `sk-or-` keys use OpenRouter automatically. Set `LLM_MODEL` to a provider-supported model such as `gpt-4o-mini` or `openai/gpt-4o-mini`, then restart the backend. If the provider is unavailable, the validated local rule engine remains the fallback.
 
 ## API surface
 

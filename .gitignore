@@ -1,6 +1,8 @@
 node_modules/
 frontend/dist/
 backend/.env
+backend/agent-memory.json
+backend/operational-state.json
 .env
 .vscode/
 *.log

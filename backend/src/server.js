@@ -8,6 +8,14 @@ const { authenticateUser, getProfile, updateProfile, issueToken, requireAuth, re
 
 const app = express();
 const port = process.env.PORT || 4000;
+const automationIntervalMs = Math.max(60000, Number(process.env.AI_AUTOMATION_INTERVAL_MS) || 300000);
+const automation = {
+  enabled: process.env.AI_AUTOMATION_ENABLED !== 'false',
+  intervalMs: automationIntervalMs,
+  lastRunAt: null,
+  nextRunAt: null,
+  lastError: null
+};
 const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173').split(',').map(origin => origin.trim());
 app.use(cors({ origin: (origin, callback) => {
   if (!origin || allowedOrigins.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1):5173$/.test(origin)) return callback(null, true);
@@ -30,10 +38,11 @@ const getDashboardState = (workspaceName = 'Hyderabad Operations', user = null) 
   });
   const critical = bins.filter(bin => bin.priority === 'CRITICAL').length;
   const high = bins.filter(bin => bin.priority === 'HIGH').length;
-  const activeTasks = visibleTasks.filter(task => !['COMPLETED', 'CANCELLED'].includes(task.status)).length;
+  const activeTasks = visibleTasks.filter(task => !['VERIFIED', 'COMPLETED', 'CANCELLED'].includes(task.status)).length;
   const totalWasteGenerated = bins.reduce((sum, bin) => sum + Math.max(0, bin.fill * (bin.capacity / 100)), 0);
-  const totalWasteCollected = visibleTasks.filter(task => task.status === 'COMPLETED').reduce((sum, task) => sum + (task.collectedQuantity || 0), 0);
-  const diversion = totalWasteCollected > 0 ? Math.min(95, Math.round((totalWasteCollected / Math.max(totalWasteGenerated, 1)) * 100)) : 62;
+  const completedTasks = visibleTasks.filter(task => ['COMPLETED', 'VERIFIED'].includes(task.status));
+  const totalWasteCollected = completedTasks.reduce((sum, task) => sum + (task.collectedQuantity || 0), 0);
+  const diversion = totalWasteCollected > 0 ? Math.min(95, Math.round((totalWasteCollected / Math.max(totalWasteGenerated, 1)) * 100)) : 0;
   const routeDistance = Number(visibleTasks.reduce((sum, task) => sum + (task.distance || 0), 0).toFixed(1));
   const routeEfficiency = Math.max(70, Math.min(97, Math.round(100 - (routeDistance / Math.max(totalWasteGenerated / 16, 1)))));
   const recyclingRate = Math.max(35, Math.min(95, Math.round((bins.filter(bin => ['Organic', 'Paper', 'Glass'].includes(bin.wasteType)).reduce((sum, bin) => sum + bin.fill, 0) / Math.max(bins.length, 1)))));
@@ -42,7 +51,7 @@ const getDashboardState = (workspaceName = 'Hyderabad Operations', user = null) 
       totalBins: bins.length,
       criticalBins: critical,
       overflowRisk: critical + high,
-      todaysWaste: Math.round(totalWasteGenerated * 0.62),
+      todaysWaste: Math.round(totalWasteGenerated),
       activeTasks,
       availableVehicles: store.vehicles.filter(vehicle => vehicle.status === 'AVAILABLE').length,
       assignedRoutes: store.routes.filter(route => !['COMPLETED', 'CANCELLED'].includes(route.status)).length,
@@ -57,7 +66,10 @@ const getDashboardState = (workspaceName = 'Hyderabad Operations', user = null) 
       recyclingRate,
       routeEfficiency,
       overflowIncidents: store.incidents.filter(item => item.status !== 'RESOLVED').length,
-      completedCollections: visibleTasks.filter(task => task.status === 'COMPLETED').length,
+      completedCollections: completedTasks.length,
+      taskCompletionRate: visibleTasks.length ? Math.round((completedTasks.length / visibleTasks.length) * 100) : 0,
+      vehicleUtilization: store.vehicles.length ? Math.round((store.vehicles.filter(v => ['ASSIGNED', 'EN_ROUTE', 'COLLECTING'].includes(v.status)).length / store.vehicles.length) * 100) : 0,
+      driverUtilization: store.drivers.length ? Math.round((store.drivers.filter(d => d.status === 'ON_ROUTE').length / store.drivers.length) * 100) : 0,
       routeDistance,
       estimatedFuel: Number((routeDistance * 0.16).toFixed(1))
     },
@@ -359,26 +371,38 @@ app.patch('/api/collections/:id/details', requireAuth, requirePermission('tasks.
   if (!parsed.success) return res.status(400).json({ error: 'Invalid task update', details: parsed.error.flatten() });
   const task = store.tasks.find(item => item.id === req.params.id);
   if (!task) return res.status(404).json({ error: 'Collection task not found' });
-  if (parsed.data.vehicleId && !store.vehicles.some(item => item.id === parsed.data.vehicleId)) return res.status(404).json({ error: 'Vehicle not found' });
   if (parsed.data.assigneeId) {
     const assignee = findUser(parsed.data.assigneeId);
     if (!assignee || assignee.role !== ROLES.OPERATOR || assignee.status !== 'ACTIVE') return res.status(400).json({ error: 'An active operator is required' });
   }
-  Object.assign(task, parsed.data);
-  if (parsed.data.vehicleId) task.vehicle = parsed.data.vehicleId;
-  if (parsed.data.assigneeId) { task.driver = findUser(parsed.data.assigneeId).name; if (task.status === 'PENDING') task.status = 'ASSIGNED'; }
+  const { vehicleId, ...safeFields } = parsed.data;
+  try {
+    if (vehicleId) agent.reassignTaskResources(task.id, { vehicleId });
+    Object.assign(task, safeFields);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
   store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: 'Updated collection task', resource: 'task', resourceId: task.id, timestamp: new Date().toISOString(), metadata: parsed.data });
+  store.persistOperationalState();
   res.json(task);
 });
 app.patch('/api/collections/:id/assign', requireAuth, requirePermission('tasks.assign'), (req, res) => {
+  const assignment = z.object({ vehicleId: z.string().min(1).optional(), driverId: z.string().min(1).optional(), assigneeId: z.string().min(1).optional() }).safeParse(req.body || {});
+  if (!assignment.success) return res.status(400).json({ error: 'Invalid assignment payload' });
   const task = store.tasks.find(item => item.id === req.params.id);
   if (!task) return res.status(404).json({ error: 'Collection task not found' });
-  const assignee = findUser(req.body?.assigneeId);
-  if (!assignee || assignee.role !== ROLES.OPERATOR || assignee.status !== 'ACTIVE') return res.status(400).json({ error: 'An active operator is required' });
-  task.assigneeId = assignee.id;
-  task.driver = assignee.name;
-  if (task.status === 'PENDING') task.status = 'ASSIGNED';
-  store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: 'Assigned collection task', resource: 'task', resourceId: task.id, timestamp: new Date().toISOString(), metadata: { assigneeId: assignee.id } });
+  if (assignment.data.driverId || assignment.data.vehicleId) {
+    try { agent.reassignTaskResources(task.id, { driverId: assignment.data.driverId, vehicleId: assignment.data.vehicleId }); }
+    catch (error) { return res.status(400).json({ error: error.message }); }
+  }
+  if (assignment.data.assigneeId) {
+    const assignee = findUser(assignment.data.assigneeId);
+    if (!assignee || assignee.role !== ROLES.OPERATOR || assignee.status !== 'ACTIVE') return res.status(400).json({ error: 'An active operator is required' });
+    task.assigneeId = assignee.id;
+  }
+  if (!assignment.data.vehicleId && !assignment.data.driverId && !assignment.data.assigneeId) return res.status(400).json({ error: 'Provide a fleet vehicleId, driverId, or application assigneeId.' });
+  store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: 'Assigned collection task resources', resource: 'task', resourceId: task.id, timestamp: new Date().toISOString(), metadata: { assigneeId: task.assigneeId || null, vehicleId: task.vehicle || null, driverId: task.driverId || null } });
+  store.persistOperationalState();
   res.json(task);
 });
 app.get('/api/incidents', requireAuth, (_, res) => res.json(store.incidents));
@@ -409,7 +433,7 @@ app.patch('/api/notifications/read-all', requireAuth, (req, res) => {
   res.json({ success: true, count: store.notifications.length });
 });
 app.get('/api/audit-logs', requireAuth, requirePermission('audit.read'), (_, res) => res.json(store.auditLogs));
-app.get('/api/drivers', requireAuth, requirePermission('drivers.read'), (_, res) => res.json(store.drivers.map(driver => ({ ...driver, currentTask: store.tasks.find(task => task.driver === driver.name && !['COMPLETED', 'CANCELLED'].includes(task.status)) || null, taskHistory: store.tasks.filter(task => task.driver === driver.name) }))));
+app.get('/api/drivers', requireAuth, requirePermission('drivers.read'), (_, res) => res.json(store.drivers.map(driver => ({ ...driver, currentTask: store.tasks.find(task => task.driver === driver.name && !['COMPLETED', 'VERIFIED', 'CANCELLED'].includes(task.status)) || null, taskHistory: store.tasks.filter(task => task.driver === driver.name) }))));
 app.patch('/api/drivers/:id', requireAuth, requirePermission('drivers.update'), (req, res) => {
   const schema = z.object({ name: z.string().min(1).optional(), phone: z.string().min(1).optional(), licenseNumber: z.string().min(1).optional(), status: z.enum(['ONLINE', 'OFFLINE', 'ON_ROUTE', 'ON_BREAK', 'BUSY']).optional(), vehicleId: z.string().nullable().optional() });
   const parsed = schema.safeParse(req.body || {});
@@ -422,8 +446,8 @@ app.patch('/api/drivers/:id', requireAuth, requirePermission('drivers.update'), 
   res.json(driver);
 });
 app.get('/api/agents', requireAuth, requirePermission('agents.read'), (_, res) => res.json(store.agents));
-app.post('/api/agents/route-optimize', requireAuth, requireRole('ADMIN'), (_, res) => {
-  const run = agent.runOptimization('manual');
+app.post('/api/agents/route-optimize', requireAuth, requireRole('ADMIN'), async (_, res) => {
+  const run = await agent.runOptimization('manual', _.user);
   res.status(201).json({ success: true, message: 'Route optimization completed', data: run, ...run });
 });
 app.post('/api/agents/overflow-predict', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
@@ -440,6 +464,12 @@ app.post('/api/agents/dispatch', requireAuth, requireRole('ADMIN', 'OPERATOR'), 
   res.status(201).json({ success: true, message: 'Dispatch generated', data: task, ...task });
 });
 app.get('/api/agents/activity', requireAuth, requirePermission('agents.read'), (_, res) => res.json(store.auditLogs.filter(log => ['task', 'vehicle', 'alert', 'agent'].includes(log.resource)).slice(0, 20)));
+app.get('/api/agents/memory', requireAuth, requirePermission('agents.read'), (_, res) => res.json({
+  runs: store.agentRuns.slice(0, 20),
+  decisions: store.agentDecisions.slice(0, 50),
+  timeline: store.agentTimeline.slice(0, 50),
+  audit: store.auditLogs.filter(log => log.resource === 'agent').slice(0, 50)
+}));
 app.get('/api/settings', requireAuth, requirePermission('settings.read'), (_, res) => res.json(store.settings));
 app.patch('/api/settings', requireAuth, requirePermission('settings.manage'), (req, res) => {
   const schema = z.object({ organizationName: z.string().min(1).optional(), overflowThreshold: z.number().min(1).max(100).optional(), vehicleLoadWarning: z.number().min(1).max(100).optional(), criticalAlerts: z.boolean().optional(), vehicleAlerts: z.boolean().optional(), taskAlerts: z.boolean().optional(), agentAlerts: z.boolean().optional(), mapZoom: z.number().min(1).max(20).optional() });
@@ -459,10 +489,20 @@ app.get('/api/analytics', requireAuth, requirePermission('analytics.read'), (req
   res.json({ success: true, message: 'Analytics loaded', data: payload, ...payload });
 });
 app.get('/api/reports', requireAuth, requirePermission('reports.read'), (req, res) => res.json({ generatedAt: new Date().toISOString(), metrics: getDashboardState(req.user.workspace || 'Hyderabad Operations', req.user).metrics, tasks: req.user.role === ROLES.OPERATOR ? store.tasks.filter(task => task.assigneeId === req.user.sub) : store.tasks }));
-app.get('/api/ai/status', requireAuth, (_, res) => res.json({ online: true, mode: process.env.OPENAI_API_KEY || process.env.LLM_API_KEY ? 'LLM' : 'LOCAL_RULE_ENGINE', lastRun: store.aiRuns[0] || null, nextRun: null, scheduler: false }));
+app.get('/api/ai/status', requireAuth, (_, res) => res.json({
+  online: true,
+  mode: process.env.OPENAI_API_KEY || process.env.LLM_API_KEY ? 'LLM' : 'LOCAL_RULE_ENGINE',
+  lastRun: store.aiRuns[0] || null,
+  state: agent.getAgentRuntime().state,
+  updatedAt: agent.getAgentRuntime().updatedAt,
+  lastError: agent.getAgentRuntime().lastError,
+  nextRun: automation.nextRunAt,
+  scheduler: automation.enabled,
+  automation: { enabled: automation.enabled, intervalMs: automation.intervalMs, lastRunAt: automation.lastRunAt, lastError: automation.lastError }
+}));
 app.get('/api/ai/runs', requireAuth, requirePermission('analytics.read'), (_, res) => res.json(store.aiRuns));
 app.post('/api/ai/run', requireAuth, requireRole('ADMIN'), async (_, res) => {
-  const run = await agent.runAgentLoop({ trigger: 'manual', prompt: 'Assess Hyderabad operations and execute the next validated action.', user: _.user });
+  const run = await agent.runOptimization('manual', _.user);
   res.status(201).json(run);
 });
 app.post('/api/agent/query', requireAuth, async (req, res) => {
@@ -489,7 +529,7 @@ app.patch('/api/collections/:id', requireAuth, requireRole('ADMIN', 'OPERATOR'),
   const requestedStatus = String(req.body?.status || '').toUpperCase();
   if (!requestedStatus) return res.status(400).json({ error: 'Missing task status' });
 
-  if (req.user.role === ROLES.OPERATOR && !['ASSIGNED', 'IN_PROGRESS', 'COMPLETED'].includes(requestedStatus)) return res.status(403).json({ error: 'Operators cannot perform this task action' });
+  if (req.user.role === ROLES.OPERATOR && !['DISPATCHED', 'DRIVER_EN_ROUTE', 'ARRIVED', 'COLLECTING', 'COMPLETED', 'VERIFIED', 'ASSIGNED', 'IN_PROGRESS'].includes(requestedStatus)) return res.status(403).json({ error: 'Operators cannot perform this task action' });
 
   if (requestedStatus === 'COMPLETED') {
     const updated = agent.completeTask(task.id, {
@@ -525,6 +565,25 @@ app.patch('/api/alerts/:id/status', requireAuth, requireRole('ADMIN', 'OPERATOR'
 app.use((err, _, res, __) => res.status(500).json({ success: false, error: 'Unexpected server error', message: err.message }));
 
 const server = app.listen(port, () => console.log(`EcoFlow API listening on http://localhost:${port}`));
+const runScheduledOptimization = async () => {
+  if (!automation.enabled) return;
+  try {
+    const monitoring = agent.monitorActiveTasks('scheduled');
+    const run = await agent.runOptimization('scheduled', { role: 'ADMIN', workspace: 'Hyderabad Operations' });
+    automation.lastResult = { monitoring, runId: run.id, replanned: run.replanned || monitoring.replanned };
+    automation.lastRunAt = new Date().toISOString();
+    automation.lastError = null;
+  } catch (error) {
+    automation.lastError = error.message;
+    console.error('EcoFlow scheduled optimization failed:', error.message);
+  } finally {
+    automation.nextRunAt = new Date(Date.now() + automation.intervalMs).toISOString();
+  }
+};
+if (automation.enabled) {
+  runScheduledOptimization();
+  setInterval(runScheduledOptimization, automation.intervalMs);
+}
 server.on('error', error => {
   if (error.code === 'EADDRINUSE') {
     console.error(`EcoFlow API is already running on port ${port}; refusing to start a duplicate server.`);

@@ -1,4 +1,7 @@
+const fs = require('fs');
+const path = require('path');
 const wasteTypes = ['Organic', 'Plastic', 'Paper', 'Glass', 'Metal', 'Food', 'Mixed'];
+const STATE_FILE = path.join(__dirname, '..', 'operational-state.json');
 
 const HYDERABAD = { city: 'Hyderabad', state: 'Telangana', workspace: 'Hyderabad Operations' };
 const locationSeeds = [
@@ -69,6 +72,7 @@ const drivers = [
   { id: 'D-005', name: 'Arjun Das', phone: '+91 90000 10005', licenseNumber: 'TS09-DRV-1005', vehicleId: 'V-05', status: 'OFFLINE', location: 'Uppal', completedTasks: 36, rating: 4.5, lastActive: new Date(Date.now() - 3600000).toISOString() },
   { id: 'D-006', name: 'Sana Ali', phone: '+91 90000 10006', licenseNumber: 'TS09-DRV-1006', vehicleId: 'V-06', status: 'ON_BREAK', location: 'Somajiguda', completedTasks: 39, rating: 4.6, lastActive: new Date().toISOString() }
 ];
+const initialDrivers = drivers.map(driver => ({ ...driver }));
 
 const tasks = [
   { id: 'CT-1048', priority: 'HIGH', source: 'AI', bins: ['HYG-002', 'HYG-003'], vehicle: 'V-02', driver: 'Ananya Rao', assigneeId: 'U-002', routeId: 'HYD-RT-002', distance: 5.8, duration: 32, status: 'IN_PROGRESS', reason: 'HYG-002 in HITEC City is predicted to overflow in 2h 10m.', createdAt: new Date().toISOString(), collectedQuantity: 0, notes: '', contaminationLevel: 'MEDIUM' },
@@ -109,6 +113,7 @@ const readings = Array.from({ length: 14 }, (_, day) => ({
 const agentRuns = [];
 const agentDecisions = [];
 const agentTimeline = [];
+const collectionHistory = [];
 
 function resetDemoState() {
   const sourceBins = Array.from({ length: 24 }, (_, index) => {
@@ -173,6 +178,7 @@ function resetDemoState() {
   bins.splice(0, bins.length, ...sourceBins);
   vehicles.splice(0, vehicles.length, ...sourceVehicles);
   tasks.splice(0, tasks.length, ...sourceTasks);
+  drivers.splice(0, drivers.length, ...initialDrivers.map(driver => ({ ...driver })));
   incidents.splice(0, incidents.length, ...sourceIncidents);
   notifications.splice(0, notifications.length, ...sourceNotifications);
   auditLogs.splice(0, auditLogs.length, ...[]);
@@ -180,7 +186,37 @@ function resetDemoState() {
   agentRuns.splice(0, agentRuns.length, ...[]);
   agentDecisions.splice(0, agentDecisions.length, ...[]);
   agentTimeline.splice(0, agentTimeline.length, ...[]);
+  collectionHistory.splice(0, collectionHistory.length, ...[]);
   routes.splice(0, routes.length, ...routeSeeds.map(([id, name], index) => ({ id, name, bins: tasks[index % tasks.length].bins, operatorId: 'U-002', vehicleId: `V-${String((index % 6) + 1).padStart(2, '0')}`, status: index === 1 ? 'IN_PROGRESS' : 'PLANNED', distance: 8 + index * 1.7, createdAt: new Date().toISOString(), stops: name.split(' → ') })));
 }
 
-module.exports = { bins, vehicles, drivers, tasks, routes, locations: locationRecords, notifications, incidents, auditLogs, aiRuns, agentRuns, agentDecisions, agentTimeline, agents, settings, defaultSettings, readings, wasteTypes, resetDemoState };
+function replaceContents(target, values) {
+  if (!Array.isArray(values)) return;
+  target.splice(0, target.length, ...values);
+}
+
+function persistOperationalState() {
+  const state = {
+    savedAt: new Date().toISOString(),
+    bins, vehicles, drivers, tasks, routes, notifications, incidents,
+    auditLogs: auditLogs.slice(0, 500), aiRuns: aiRuns.slice(0, 100),
+    agentRuns: agentRuns.slice(0, 100), agentDecisions: agentDecisions.slice(0, 250), agentTimeline: agentTimeline.slice(0, 250),
+    collectionHistory: collectionHistory.slice(0, 500)
+  };
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+}
+
+function loadOperationalState() {
+  try {
+    const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    replaceContents(bins, state.bins); replaceContents(vehicles, state.vehicles); replaceContents(drivers, state.drivers);
+    replaceContents(tasks, state.tasks); replaceContents(routes, state.routes); replaceContents(notifications, state.notifications);
+    replaceContents(incidents, state.incidents); replaceContents(auditLogs, state.auditLogs); replaceContents(aiRuns, state.aiRuns);
+    replaceContents(agentRuns, state.agentRuns); replaceContents(agentDecisions, state.agentDecisions); replaceContents(agentTimeline, state.agentTimeline);
+    replaceContents(collectionHistory, state.collectionHistory);
+  } catch (_) { /* first start uses Hyderabad seed data */ }
+}
+
+loadOperationalState();
+
+module.exports = { bins, vehicles, drivers, tasks, routes, locations: locationRecords, notifications, incidents, auditLogs, aiRuns, agentRuns, agentDecisions, agentTimeline, collectionHistory, agents, settings, defaultSettings, readings, wasteTypes, resetDemoState, persistOperationalState, loadOperationalState, STATE_FILE };

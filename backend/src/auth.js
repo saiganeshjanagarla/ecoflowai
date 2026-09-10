@@ -97,7 +97,11 @@ function deleteUser(id) {
   return true;
 }
 
-const secret = process.env.JWT_SECRET || 'replace-me-with-a-strong-secret';
+const insecureDefaultSecret = 'replace-me-with-a-strong-secret';
+const secret = process.env.JWT_SECRET || insecureDefaultSecret;
+if (process.env.NODE_ENV === 'production' && secret === insecureDefaultSecret) {
+  throw new Error('JWT_SECRET must be configured with a strong production secret.');
+}
 const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url');
 const sign = value => crypto.createHmac('sha256', secret).update(value).digest('base64url');
 
