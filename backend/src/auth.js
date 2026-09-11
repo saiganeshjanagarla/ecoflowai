@@ -1,18 +1,34 @@
 const crypto = require('crypto');
 
-const hashPassword = password => crypto.createHash('sha256').update(String(password)).digest('hex');
+const hashPassword = password => {
+  const salt = crypto.randomBytes(16);
+  const derived = crypto.scryptSync(String(password), salt, 64);
+  return `scrypt$${salt.toString('base64url')}$${derived.toString('base64url')}`;
+};
+const verifyPassword = (password, encoded) => {
+  const [algorithm, saltValue, hashValue] = String(encoded || '').split('$');
+  if (algorithm !== 'scrypt' || !saltValue || !hashValue) return false;
+  try {
+    const expected = Buffer.from(hashValue, 'base64url');
+    const actual = crypto.scryptSync(String(password), Buffer.from(saltValue, 'base64url'), expected.length);
+    return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+  } catch (_) { return false; }
+};
 
-const ROLES = Object.freeze({ ADMIN: 'ADMIN', OPERATOR: 'OPERATOR', VIEWER: 'VIEWER' });
+const ROLES = Object.freeze({ ADMIN: 'ADMIN', OPERATOR: 'OPERATOR', VIEWER: 'VIEWER', CITIZEN: 'CITIZEN' });
+const SUPPORTED_WORKSPACES = Object.freeze(['Hyderabad Operations', 'Warangal Operations']);
 const PERMISSIONS = Object.freeze({
   ADMIN: new Set(['users.read', 'users.create', 'users.update', 'users.delete', 'bins.read', 'bins.create', 'bins.update', 'bins.delete', 'tasks.read', 'tasks.create', 'tasks.assign', 'tasks.update', 'tasks.delete', 'routes.read', 'routes.create', 'routes.update', 'routes.delete', 'routes.assign', 'locations.read', 'locations.create', 'locations.update', 'locations.delete', 'vehicles.read', 'vehicles.create', 'vehicles.update', 'vehicles.delete', 'drivers.read', 'drivers.create', 'drivers.update', 'drivers.delete', 'alerts.read', 'alerts.report', 'alerts.resolve', 'analytics.read', 'reports.read', 'reports.export', 'audit.read', 'agents.read', 'settings.read', 'settings.manage']),
   OPERATOR: new Set(['bins.read', 'tasks.read', 'tasks.create', 'tasks.updateOwn', 'routes.read', 'routes.updateOwn', 'locations.read', 'vehicles.read', 'drivers.read', 'alerts.read', 'alerts.report', 'alerts.resolveOwn', 'analytics.read', 'reports.read', 'agents.read', 'settings.read', 'performance.readOwn']),
-  VIEWER: new Set(['bins.read', 'tasks.read', 'routes.read', 'locations.read', 'vehicles.read', 'drivers.read', 'alerts.read', 'analytics.read', 'reports.read', 'agents.read', 'settings.read'])
+  VIEWER: new Set(['reports.create'])
+  ,CITIZEN: new Set(['reports.create'])
 });
 
 const users = [
   { id: 'U-001', email: 'saiganesh@gmail.com', password: hashPassword('ultron2026'), name: 'Sai Ganesh', phone: '+91 90000 00001', role: ROLES.ADMIN, status: 'ACTIVE', lastLogin: null, workspace: 'Hyderabad Operations', notifications: true, autoRefresh: true },
   { id: 'U-002', email: 'bhanu@gmail.com', password: hashPassword('ultron2026'), name: 'Raj', phone: '+91 90000 00002', role: ROLES.OPERATOR, status: 'ACTIVE', lastLogin: null, workspace: 'Hyderabad Operations', notifications: true, autoRefresh: true },
-  { id: 'U-003', email: 'user@gmail.com', password: hashPassword('123456'), name: 'EcoFlow Viewer', phone: '+91 90000 00003', role: ROLES.VIEWER, status: 'ACTIVE', lastLogin: null, workspace: 'Hyderabad Operations', notifications: true, autoRefresh: true }
+  { id: 'U-003', email: 'user@gmail.com', password: hashPassword('123456'), name: 'EcoFlow User', phone: '+91 90000 00003', role: ROLES.VIEWER, status: 'ACTIVE', lastLogin: null, workspace: 'Hyderabad Operations', notifications: true, autoRefresh: true }
+  ,{ id: 'U-004', email: 'citizen@gmail.com', password: hashPassword('123456'), name: 'Hyderabad Citizen', phone: '+91 90000 00004', role: ROLES.CITIZEN, status: 'ACTIVE', lastLogin: null, workspace: 'Hyderabad Operations', notifications: true, autoRefresh: true }
 ];
 
 const profileStore = new Map();
@@ -35,6 +51,7 @@ function getProfile(user) {
 }
 
 function updateProfile(user, updates = {}) {
+  if (updates.workspace && !SUPPORTED_WORKSPACES.includes(updates.workspace)) throw new Error('Unsupported city. Choose Hyderabad or Warangal.');
   const current = getProfile(user);
   const next = {
     ...current,
@@ -97,13 +114,12 @@ function deleteUser(id) {
   return true;
 }
 
-const insecureDefaultSecret = 'replace-me-with-a-strong-secret';
-const secret = process.env.JWT_SECRET || insecureDefaultSecret;
-if (process.env.NODE_ENV === 'production' && secret === insecureDefaultSecret) {
-  throw new Error('JWT_SECRET must be configured with a strong production secret.');
-}
+const secret = process.env.JWT_SECRET;
+const runningTests = process.env.NODE_ENV === 'test' || process.argv.includes('--test');
+if ((!secret || secret.length < 32) && !runningTests) throw new Error('JWT_SECRET must be configured with at least 32 characters.');
+const signingSecret = secret || 'test-only-ecoflow-secret-0123456789012345';
 const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url');
-const sign = value => crypto.createHmac('sha256', secret).update(value).digest('base64url');
+const sign = value => crypto.createHmac('sha256', signingSecret).update(value).digest('base64url');
 
 function issueToken(user) {
   const payload = encode({ sub: user.id, email: user.email, role: user.role, name: user.name, workspace: user.workspace, exp: Date.now() + 8 * 60 * 60 * 1000 });
@@ -121,8 +137,7 @@ function verifyToken(token) {
 }
 
 function authenticateUser(email, password) {
-  const hashed = hashPassword(password);
-  const user = users.find(item => item.email === email && item.password === hashed && item.status === 'ACTIVE') || null;
+  const user = users.find(item => item.email === email && verifyPassword(password, item.password) && item.status === 'ACTIVE') || null;
   if (user) user.lastLogin = new Date().toISOString();
   return user;
 }
@@ -130,6 +145,8 @@ function authenticateUser(email, password) {
 function requireAuth(req, res, next) {
   const user = verifyToken(req.headers.authorization?.replace(/^Bearer\s+/i, ''));
   if (!user) return res.status(401).json({ error: 'Authentication required' });
+  const account = findUser(user.sub);
+  if (!account || account.status !== 'ACTIVE') return res.status(401).json({ error: 'Session is no longer active' });
   req.user = { ...user, ...getProfile({ id: user.sub, email: user.email, role: user.role, name: user.name }) };
   next();
 }
@@ -142,4 +159,4 @@ function requirePermission(permission) {
   return (req, res, next) => PERMISSIONS[req.user?.role]?.has(permission) ? next() : res.status(403).json({ error: `Permission required: ${permission}` });
 }
 
-module.exports = { ROLES, PERMISSIONS, users, authenticateUser, getProfile, updateProfile, publicUser, listUsers, findUser, createUser, updateUser, deleteUser, issueToken, verifyToken, requireAuth, requireRole, requirePermission };
+module.exports = { ROLES, PERMISSIONS, SUPPORTED_WORKSPACES, users, authenticateUser, getProfile, updateProfile, publicUser, listUsers, findUser, createUser, updateUser, deleteUser, issueToken, verifyToken, requireAuth, requireRole, requirePermission };

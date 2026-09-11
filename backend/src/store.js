@@ -4,6 +4,11 @@ const wasteTypes = ['Organic', 'Plastic', 'Paper', 'Glass', 'Metal', 'Food', 'Mi
 const STATE_FILE = path.join(__dirname, '..', 'operational-state.json');
 
 const HYDERABAD = { city: 'Hyderabad', state: 'Telangana', workspace: 'Hyderabad Operations' };
+const WARANGAL = { city: 'Warangal', state: 'Telangana', workspace: 'Warangal Operations' };
+const cityConfigs = {
+  'Hyderabad Operations': { ...HYDERABAD, latitude: 17.3850, longitude: 78.4867, zoom: 11 },
+  'Warangal Operations': { ...WARANGAL, latitude: 17.9689, longitude: 79.5941, zoom: 12 }
+};
 const locationSeeds = [
   ['Gachibowli', 'Gachibowli', 17.4401, 78.3489], ['HITEC City', 'HITEC City', 17.4435, 78.3772],
   ['Madhapur', 'Madhapur', 17.4483, 78.3915], ['Kondapur', 'Kondapur', 17.4580, 78.3630],
@@ -47,9 +52,18 @@ const bins = Array.from({ length: 24 }, (_, index) => {
     predictedOverflowTime: null,
     status: fill >= 95 ? 'CRITICAL' : fill >= 85 ? 'HIGH' : fill >= 70 ? 'MEDIUM' : 'NORMAL',
     workspace: HYDERABAD.workspace,
-    nextScheduledCollection: new Date(Date.now() + (index + 1) * 3600000).toISOString()
+    nextScheduledCollection: new Date(Date.now() + (index + 1) * 3600000).toISOString(),
+    dataSource: index === 0 ? 'IoT_SENSOR' : 'SIMULATED',
+    sensorId: index === 0 ? 'ESP32-HYG-001' : `SIM-HYG-${String(index + 1).padStart(3, '0')}`,
+    lastTelemetryAt: new Date().toISOString(),
+    weightKg: Math.max(15, (fill / 100) * 120)
   };
 });
+
+const telemetry = [];
+const publicReports = [];
+const history = [];
+const sensorMetadata = [];
 
 const vehicles = Array.from({ length: 6 }, (_, index) => ({
   id: `V-${String(index + 1).padStart(2, '0')}`,
@@ -106,6 +120,24 @@ const settings = { ...defaultSettings, mapCenter: [...defaultSettings.mapCenter]
 const routeSeeds = [['HYD-RT-001', 'Gachibowli → Nanakramguda → Financial District → Kokapet'], ['HYD-RT-002', 'Madhapur → HITEC City → Kondapur → Kothaguda'], ['HYD-RT-003', 'Kukatpally → KPHB → Miyapur'], ['HYD-RT-004', 'Jubilee Hills → Banjara Hills → Punjagutta → Somajiguda'], ['HYD-RT-005', 'Uppal → Tarnaka → Secunderabad'], ['HYD-RT-006', 'LB Nagar → Dilsukhnagar → Kothapet'], ['HYD-RT-007', 'Mehdipatnam → Tolichowki → Masab Tank']];
 const routes = routeSeeds.map(([id, name], index) => ({ id, name, bins: tasks[index % tasks.length].bins, operatorId: 'U-002', vehicleId: `V-${String((index % 6) + 1).padStart(2, '0')}`, status: index === 1 ? 'IN_PROGRESS' : 'PLANNED', distance: 8 + index * 1.7, createdAt: new Date().toISOString(), stops: name.split(' → ') }));
 const locationRecords = locationSeeds.map(([name, area, latitude, longitude]) => ({ id: `LOC-${name.toUpperCase().replace(/[^A-Z]+/g, '-').replace(/^-|-$/g, '')}`, name, area, city: HYDERABAD.city, state: HYDERABAD.state, latitude, longitude, workspace: HYDERABAD.workspace }));
+const warangalLocations = [
+  ['Hanamkonda', 17.9784, 79.5941], ['Kazipet', 17.9687, 79.5300], ['Warangal Fort', 17.9785, 79.6000],
+  ['NIT Warangal', 17.9826, 79.5301], ['Subedari', 17.9913, 79.5901], ['Mulugu Road', 17.9655, 79.6200]
+].map(([name, latitude, longitude]) => ({ id: `LOC-WAR-${name.toUpperCase().replace(/[^A-Z]+/g, '-')}`, name, area: name, city: WARANGAL.city, state: WARANGAL.state, latitude, longitude, workspace: WARANGAL.workspace }));
+const warangalBins = warangalLocations.map((location, index) => ({
+  id: `WYG-${String(index + 1).padStart(3, '0')}`, name: `${location.name} Collection Point ${index + 1}`, location: location.name, area: location.area,
+  city: WARANGAL.city, state: WARANGAL.state, latitude: location.latitude, longitude: location.longitude, wasteType: wasteTypes[(index + 2) % wasteTypes.length],
+  capacity: 240 + (index % 3) * 80, fill: [72, 48, 86, 61, 94, 39][index], fillRate: Number((1.1 + (index % 4) * 0.6).toFixed(1)), temperature: 25 + index,
+  battery: 82 + (index % 3) * 5, lastCollected: new Date(Date.now() - (index + 2) * 3600000 * 3).toISOString(), sensorStatus: 'ONLINE',
+  priority: index === 4 ? 'CRITICAL' : index === 2 ? 'HIGH' : index === 0 ? 'MEDIUM' : 'LOW', predictedOverflowTime: null,
+  status: index === 4 ? 'CRITICAL' : index === 2 ? 'HIGH' : index === 0 ? 'MEDIUM' : 'NORMAL', workspace: WARANGAL.workspace,
+  nextScheduledCollection: new Date(Date.now() + (index + 2) * 3600000).toISOString(), dataSource: 'SIMULATED_DEMO', sensorId: `SIM-WAR-${String(index + 1).padStart(3, '0')}`,
+  lastTelemetryAt: new Date().toISOString(), weightKg: Math.max(15, [72, 48, 86, 61, 94, 39][index] / 100 * 120)
+}));
+const warangalVehicles = Array.from({ length: 3 }, (_, index) => ({ id: `WV-${String(index + 1).padStart(2, '0')}`, registration: `TS-24-WR-${String(2400 + index)}`, type: index % 2 ? 'Compactor' : 'Electric tipper', capacity: 900 + index * 300, currentLoad: 0, location: warangalLocations[index].name, driver: `Warangal Driver ${index + 1}`, status: 'AVAILABLE', fuelLevel: 82 + index * 4, lastService: new Date(Date.now() - (index + 1) * 86400000 * 7).toISOString(), workspace: WARANGAL.workspace }));
+const warangalDrivers = warangalVehicles.map((vehicle, index) => ({ id: `WD-${String(index + 1).padStart(3, '0')}`, name: `Warangal Driver ${index + 1}`, phone: `+91 90000 2${String(index + 1).padStart(4, '0')}`, licenseNumber: `TS24-WR-DRV-${index + 1}`, vehicleId: vehicle.id, status: 'ONLINE', location: vehicle.location, completedTasks: 0, rating: 4.6, lastActive: new Date().toISOString(), workspace: WARANGAL.workspace }));
+for (const record of [vehicles, drivers, tasks, routes, incidents, notifications]) record.forEach(item => { if (!item.workspace) item.workspace = HYDERABAD.workspace; });
+bins.push(...warangalBins); locationRecords.push(...warangalLocations); vehicles.push(...warangalVehicles); drivers.push(...warangalDrivers);
 const readings = Array.from({ length: 14 }, (_, day) => ({
   day: `Day ${day + 1}`, total: 330 + ((day * 47) % 120), organic: 130 + ((day * 13) % 42), plastic: 72 + ((day * 7) % 25), recycled: 170 + ((day * 17) % 50)
 }));
@@ -141,7 +173,11 @@ function resetDemoState() {
       predictedOverflowTime: null,
       status: fill >= 95 ? 'CRITICAL' : fill >= 85 ? 'HIGH' : fill >= 70 ? 'MEDIUM' : 'NORMAL',
       workspace: HYDERABAD.workspace,
-      nextScheduledCollection: new Date(Date.now() + (index + 1) * 3600000).toISOString()
+      nextScheduledCollection: new Date(Date.now() + (index + 1) * 3600000).toISOString(),
+      dataSource: index === 0 ? 'IoT_SENSOR' : 'SIMULATED',
+      sensorId: index === 0 ? 'ESP32-HYG-001' : `SIM-HYG-${String(index + 1).padStart(3, '0')}`,
+      lastTelemetryAt: new Date().toISOString(),
+      weightKg: Math.max(15, (fill / 100) * 120)
     };
   });
 
@@ -187,7 +223,12 @@ function resetDemoState() {
   agentDecisions.splice(0, agentDecisions.length, ...[]);
   agentTimeline.splice(0, agentTimeline.length, ...[]);
   collectionHistory.splice(0, collectionHistory.length, ...[]);
+  telemetry.splice(0, telemetry.length, ...[]);
+  publicReports.splice(0, publicReports.length, ...[]);
+  history.splice(0, history.length, ...[]);
+  sensorMetadata.splice(0, sensorMetadata.length, ...[]);
   routes.splice(0, routes.length, ...routeSeeds.map(([id, name], index) => ({ id, name, bins: tasks[index % tasks.length].bins, operatorId: 'U-002', vehicleId: `V-${String((index % 6) + 1).padStart(2, '0')}`, status: index === 1 ? 'IN_PROGRESS' : 'PLANNED', distance: 8 + index * 1.7, createdAt: new Date().toISOString(), stops: name.split(' → ') })));
+  for (const record of [vehicles, drivers, tasks, routes, incidents, notifications]) record.forEach(item => { if (!item.workspace) item.workspace = HYDERABAD.workspace; });
 }
 
 function replaceContents(target, values) {
@@ -201,7 +242,11 @@ function persistOperationalState() {
     bins, vehicles, drivers, tasks, routes, notifications, incidents,
     auditLogs: auditLogs.slice(0, 500), aiRuns: aiRuns.slice(0, 100),
     agentRuns: agentRuns.slice(0, 100), agentDecisions: agentDecisions.slice(0, 250), agentTimeline: agentTimeline.slice(0, 250),
-    collectionHistory: collectionHistory.slice(0, 500)
+    collectionHistory: collectionHistory.slice(0, 500),
+    telemetry: telemetry.slice(0, 500),
+    publicReports: publicReports.slice(0, 250),
+    history: history.slice(0, 500),
+    sensorMetadata: sensorMetadata.slice(0, 250)
   };
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
 }
@@ -214,9 +259,19 @@ function loadOperationalState() {
     replaceContents(incidents, state.incidents); replaceContents(auditLogs, state.auditLogs); replaceContents(aiRuns, state.aiRuns);
     replaceContents(agentRuns, state.agentRuns); replaceContents(agentDecisions, state.agentDecisions); replaceContents(agentTimeline, state.agentTimeline);
     replaceContents(collectionHistory, state.collectionHistory);
+    replaceContents(telemetry, state.telemetry || []); replaceContents(publicReports, state.publicReports || []); replaceContents(history, state.history || []); replaceContents(sensorMetadata, state.sensorMetadata || []);
   } catch (_) { /* first start uses Hyderabad seed data */ }
 }
 
-loadOperationalState();
+function ensureCityData() {
+  for (const record of [vehicles, drivers, tasks, routes, incidents, notifications]) record.forEach(item => { if (!item.workspace) item.workspace = HYDERABAD.workspace; });
+  if (!bins.some(bin => bin.workspace === WARANGAL.workspace)) bins.push(...warangalBins);
+  if (!locationRecords.some(location => location.workspace === WARANGAL.workspace)) locationRecords.push(...warangalLocations);
+  if (!vehicles.some(vehicle => vehicle.workspace === WARANGAL.workspace)) vehicles.push(...warangalVehicles);
+  if (!drivers.some(driver => driver.workspace === WARANGAL.workspace)) drivers.push(...warangalDrivers);
+}
 
-module.exports = { bins, vehicles, drivers, tasks, routes, locations: locationRecords, notifications, incidents, auditLogs, aiRuns, agentRuns, agentDecisions, agentTimeline, collectionHistory, agents, settings, defaultSettings, readings, wasteTypes, resetDemoState, persistOperationalState, loadOperationalState, STATE_FILE };
+loadOperationalState();
+ensureCityData();
+
+module.exports = { bins, vehicles, drivers, tasks, routes, locations: locationRecords, notifications, incidents, auditLogs, aiRuns, agentRuns, agentDecisions, agentTimeline, collectionHistory, telemetry, publicReports, history, sensorMetadata, agents, settings, defaultSettings, readings, wasteTypes, cityConfigs, supportedWorkspaces: Object.keys(cityConfigs), resetDemoState, persistOperationalState, loadOperationalState, ensureCityData, STATE_FILE };

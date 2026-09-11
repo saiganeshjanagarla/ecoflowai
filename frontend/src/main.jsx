@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import L from 'leaflet';
-import { Activity, AlertTriangle, Bell, Bot, Check, CheckCircle2, ChevronRight, CircleDot, Clock3, Fuel, Gauge, Layers3, Leaf, LogOut, Map, Menu, MessageCircle, PackageCheck, Radio, Route, Send, Settings2, Truck, UserRound, X } from 'lucide-react';
+import { Activity, AlertTriangle, Bell, Bot, Check, CheckCircle2, ChevronRight, CircleDot, Clock3, Fuel, Gauge, ImageOff, Layers3, Leaf, LogOut, Map, Menu, MessageCircle, PackageCheck, Radio, Route, Send, Settings2, Truck, UserRound, X } from 'lucide-react';
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import './styles.css';
 import './monitoring.css';
@@ -11,6 +11,11 @@ import './operations.css';
 import 'leaflet/dist/leaflet.css';
 
 const API = 'http://localhost:4000/api';
+const SUPPORTED_WORKSPACES = ['Hyderabad Operations', 'Warangal Operations'];
+const CITY_CONFIG = {
+  'Hyderabad Operations': { name: 'Hyderabad', latitude: 17.3850, longitude: 78.4867, zoom: 11 },
+  'Warangal Operations': { name: 'Warangal', latitude: 17.9689, longitude: 79.5941, zoom: 12 }
+};
 const fetchJson = (path, options = {}) => fetch(`${API}${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...(localStorage.getItem('ecoflow_token') ? { Authorization: `Bearer ${localStorage.getItem('ecoflow_token')}` } : {}), ...options.headers } }).then(async response => {
   const contentType = response.headers.get('content-type') || '';
   const body = contentType.includes('application/json') ? await response.json() : await response.text();
@@ -19,10 +24,12 @@ const fetchJson = (path, options = {}) => fetch(`${API}${path}`, { ...options, h
   return body;
 });
 const ROLE_NAV = {
-  ADMIN: [['Overview', Gauge], ['Map', Map], ['Bin Monitoring', Layers3], ['Collection Tasks', Route], ['Routes', Route], ['Locations', Map], ['Fleet', Truck], ['Drivers', UserRound], ['Agents', Bot], ['Users', UserRound], ['Alerts', AlertTriangle], ['Analytics', Activity], ['Reports', PackageCheck], ['Audit Logs', Radio], ['Settings', Settings2], ['AI Command Center', Bot]],
-  OPERATOR: [['Overview', Gauge], ['Collection Tasks', Route], ['Routes', Route], ['Map', Map], ['Bin Monitoring', Layers3], ['Fleet', Truck], ['Drivers', UserRound], ['Agents', Bot], ['Alerts', AlertTriangle], ['Analytics', Activity], ['Settings', Settings2], ['Profile', UserRound]],
-  VIEWER: [['Overview', Gauge], ['Map', Map], ['Bin Monitoring', Layers3], ['Collection Tasks', Route], ['Routes', Route], ['Fleet', Truck], ['Drivers', UserRound], ['Agents', Bot], ['Alerts', AlertTriangle], ['Analytics', Activity], ['Reports', PackageCheck], ['Settings', Settings2], ['Profile', UserRound]]
+  ADMIN: [['Overview', Gauge], ['Map', Map], ['Bin Monitoring', Layers3], ['Collection Tasks', Route], ['Routes', Route], ['Fleet', Truck], ['Drivers', UserRound], ['Locations', Map], ['Public Reports', PackageCheck], ['Agents', Bot], ['Analytics', Activity], ['Users', UserRound], ['Audit Logs', Radio], ['Settings', Settings2]],
+  OPERATOR: [['Overview', Gauge], ['Map', Map], ['Bin Monitoring', Layers3], ['Collection Tasks', Route], ['My Routes', Route], ['Fleet Status', Truck], ['Drivers', UserRound], ['Public Reports', PackageCheck], ['Agent Activity', Bot], ['Notifications', Bell]],
+  VIEWER: [['Home', Gauge], ['Report an Issue', Send], ['My Reports', PackageCheck], ['Notifications', Bell], ['Profile', UserRound]],
+  CITIZEN: [['Home', Gauge], ['Report an Issue', Send], ['My Reports', PackageCheck], ['Notifications', Bell], ['Profile', UserRound]]
 };
+const ROLE_SERVICES = { VIEWER: [], CITIZEN: [] };
 
 function App() {
   const [dashboard, setDashboard] = useState(null);
@@ -50,13 +57,13 @@ function App() {
   const [incidentForm, setIncidentForm] = useState({ location: '', wasteType: 'Mixed', severity: 'MEDIUM', description: '' });
   const [incidentStatus, setIncidentStatus] = useState({ type: '', message: '' });
 
-  const load = async (selectedWorkspace = workspace) => {
+  const load = async (selectedWorkspace = workspace, role = sessionUser?.role) => {
     try { setError(''); const [overview, collectionTasks, notices, fleet, status] = await Promise.all([
-      fetchJson(`/dashboard?workspace=${encodeURIComponent(selectedWorkspace)}`),
-      fetchJson('/collections'),
+      ['CITIZEN', 'VIEWER'].includes(role) ? Promise.resolve({ metrics: {}, bins: [], incidents: [], wasteTrend: [] }) : fetchJson(`/dashboard?workspace=${encodeURIComponent(selectedWorkspace)}`),
+      ['CITIZEN', 'VIEWER'].includes(role) ? Promise.resolve([]) : fetchJson('/collections'),
       fetchJson('/notifications'),
-      fetchJson('/vehicles'),
-      fetchJson('/ai/status')
+      ['CITIZEN', 'VIEWER'].includes(role) ? Promise.resolve([]) : fetchJson('/vehicles'),
+      ['CITIZEN', 'VIEWER'].includes(role) ? Promise.resolve({ mode: 'CITIZEN', state: 'ONLINE' }) : fetchJson('/ai/status')
     ]); setDashboard(overview); setTasks(collectionTasks); setNotifications(notices); setVehicles(fleet); setAgentMode(status.mode || 'LOCAL_RULE_ENGINE'); setAgentState(status.state || 'OFFLINE'); } catch (err) { setError(err.message); } finally { setLoading(false); }
   };
   const saveProfileSettings = async (updates) => {
@@ -73,16 +80,16 @@ function App() {
       return null;
     }
   };
-  useEffect(() => { (async () => { try { const token = localStorage.getItem('ecoflow_token'); if (!token) return; const session = await fetchJson('/auth/me'); setSessionUser(session.user); await load(); } catch (_) { localStorage.removeItem('ecoflow_token'); } finally { setAuthLoading(false); } })(); }, []);
+  useEffect(() => { (async () => { try { const token = localStorage.getItem('ecoflow_token'); if (!token) return; const session = await fetchJson('/auth/me'); setSessionUser(session.user); await load(workspace, session.user.role); } catch (_) { localStorage.removeItem('ecoflow_token'); } finally { setAuthLoading(false); } })(); }, []);
   useEffect(() => {
     if (!sessionUser) return undefined;
     if (!sessionUser.autoRefresh) return undefined;
     const timer = setInterval(() => {
       if (localStorage.getItem('ecoflow_token')) load(workspace);
-    }, 30000);
+    }, 5000);
     return () => clearInterval(timer);
   }, [sessionUser?.autoRefresh, sessionUser?.id, workspace]);
-  const login = async (email, password) => { setAuthError(''); try { const session = await fetchJson('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }); localStorage.setItem('ecoflow_token', session.token); setSessionUser(session.user); await load(); } catch (err) { setAuthError(err.message || 'Invalid email or password'); } };
+  const login = async (email, password) => { setAuthError(''); try { const session = await fetchJson('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }); localStorage.setItem('ecoflow_token', session.token); setSessionUser(session.user); await load(workspace, session.user.role); } catch (err) { setAuthError(err.message || 'Invalid email or password'); } };
   const runAgent = async () => { setRun({ loading: true }); try { const result = await fetchJson('/ai/run', { method: 'POST' }); setRun(result); setAgentMode(result.mode || 'LOCAL_RULE_ENGINE'); setAgentState(result.agentStatus || result.state || 'COMPLETED'); await load(); return result; } catch (err) { setRun({ error: err.message }); setAgentState('ERROR'); setError(err.message); throw err; } };
   const runCommand = async query => {
     if (/run autonomous optimization|optimize today'?s routes/i.test(query)) return runAgent();
@@ -151,9 +158,12 @@ function App() {
   };
 
   const roleNav = ROLE_NAV[sessionUser?.role] || ROLE_NAV.VIEWER;
-  const canVisit = roleNav.some(([label]) => label === section);
+  const roleServices = ROLE_SERVICES[sessionUser?.role] || [];
+  const hiddenSections = sessionUser?.role === 'ADMIN' ? ['AI Command Center'] : [];
+  const canVisit = [...roleNav, ...roleServices].some(([label]) => label === section) || hiddenSections.includes(section);
   useEffect(() => {
-    if (sessionUser && !ROLE_NAV[sessionUser.role]?.some(([label]) => label === section)) setSection('Overview');
+    const allowed = [...(ROLE_NAV[sessionUser?.role] || []), ...(ROLE_SERVICES[sessionUser?.role] || [])];
+    if (sessionUser && !allowed.some(([label]) => label === section) && !(sessionUser.role === 'ADMIN' && section === 'AI Command Center')) setSection(['CITIZEN', 'VIEWER'].includes(sessionUser.role) ? 'Home' : 'Overview');
   }, [sessionUser?.role, section]);
   useEffect(() => {
     const handleDashboardShortcut = event => {
@@ -169,32 +179,42 @@ function App() {
     return () => document.removeEventListener('click', handleDashboardShortcut);
   }, []);
 
+  useEffect(() => {
+    if (!notificationsOpen) return undefined;
+    const closeOnOutsideClick = event => {
+      if (!event.target.closest('.notification-popover-anchor')) setNotificationsOpen(false);
+    };
+    document.addEventListener('pointerdown', closeOnOutsideClick);
+    return () => document.removeEventListener('pointerdown', closeOnOutsideClick);
+  }, [notificationsOpen]);
+
   if (authLoading) return <div className="loading-screen"><div className="spinner" /><span>Checking your EcoFlow session...</span></div>;
   if (!sessionUser) return <LoginScreen onLogin={login} error={authError} />;
   if (loading) return <div className="loading-screen"><div className="spinner" /><span>Connecting to EcoFlow operations...</span></div>;
   return <div className="app-shell">
     <aside className={menuOpen ? 'sidebar open' : 'sidebar'}>
       <div className="brand"><div className="brand-mark"><Leaf size={19} /></div><div><strong>EcoFlow</strong><span>AI OPERATIONS</span></div><button className="mobile-close" onClick={() => setMenuOpen(false)}><X size={18} /></button></div>
-        <div className="workspace"><span className="eyebrow">WORKSPACE</span><button className="workspace-select" onClick={() => setWorkspaceOpen(value => !value)}><span className="workspace-dot" />{workspace}<ChevronRight size={15} /></button>{workspaceOpen && <WorkspaceMenu current={workspace} onChange={changeWorkspace} />}</div>
-      <nav>{roleNav.map(([label, Icon]) => <button key={label} className={section === label ? 'nav-item active' : 'nav-item'} onClick={() => { setSection(label); setMenuOpen(false); }}><Icon size={18} /><span>{label}</span>{label === 'AI Command Center' && <span className="nav-badge">3</span>}</button>)}</nav>
-      <div className="sidebar-bottom"><div className="agent-mini"><div className="agent-pulse"><Bot size={17} /></div><div><strong>Agent online</strong><span>{agentMode === 'LLM' ? 'OpenAI LLM' : 'Local rule engine'}</span></div><CircleDot size={13} className="online-icon" /></div>{sessionUser.role === 'ADMIN' && <button className="nav-item" onClick={() => { setSettingsOpen(true); setProfileOpen(false); }}><Settings2 size={18} /><span>Settings</span></button>}<button className="user-chip" onClick={() => setProfileOpen(value => !value)}><div className="avatar">{initials(sessionUser.name)}</div><div><strong>{sessionUser.name}</strong><span>{sessionUser.role}</span></div><ChevronRight size={15} /></button>{profileOpen && <ProfileMenu user={sessionUser} logout={logout} onOpenSettings={sessionUser.role === 'ADMIN' ? () => { setProfileOpen(false); setSettingsOpen(true); } : undefined} />}{settingsOpen && <ProfileSettings user={sessionUser} workspace={workspace} onChangeWorkspace={value => { changeWorkspace(value); saveProfileSettings({ workspace: value }); }} onClose={() => setSettingsOpen(false)} onSave={async (values) => { const updated = await saveProfileSettings(values); if (updated) { setSessionUser(updated); setWorkspace(updated.workspace || workspace); } setSettingsOpen(false); }} />}</div>
+        {!['VIEWER', 'CITIZEN'].includes(sessionUser.role) && <div className="workspace"><span className="eyebrow">WORKSPACE</span><button className="workspace-select" onClick={() => setWorkspaceOpen(value => !value)}><span className="workspace-dot" />{workspace}<ChevronRight size={15} /></button>{workspaceOpen && <WorkspaceMenu current={workspace} onChange={changeWorkspace} />}</div>}
+      <nav>{roleNav.map(([label, Icon]) => <button key={label} className={section === label ? 'nav-item active' : 'nav-item'} onClick={() => { setSection(label); setMenuOpen(false); }}><Icon size={18} /><span>{label}</span>{label === 'AI Command Center' && <span className="nav-badge">3</span>}</button>)}{roleServices.length > 0 && <><span className="nav-section-label">CITIZEN SERVICES</span>{roleServices.map(([label, Icon]) => <button key={label} className={section === label ? 'nav-item active' : 'nav-item'} onClick={() => { setSection(label); setMenuOpen(false); }}><Icon size={18} /><span>{label}</span></button>)}</>}</nav>
+      {!['VIEWER', 'CITIZEN'].includes(sessionUser.role) && <div className="sidebar-bottom"><div className="agent-mini"><div className="agent-pulse"><Bot size={17} /></div><div><strong>Agent online</strong><span>{agentMode === 'LLM' ? 'OpenAI LLM' : 'Local rule engine'}</span></div><CircleDot size={13} className="online-icon" /></div><button className="user-chip" onClick={() => setProfileOpen(value => !value)}><div className="avatar">{initials(sessionUser.name)}</div><div><strong>{sessionUser.name}</strong><span>{displayRole(sessionUser.role)}</span></div><ChevronRight size={15} /></button>{profileOpen && <ProfileMenu user={sessionUser} logout={logout} onOpenSettings={sessionUser.role === 'ADMIN' ? () => { setProfileOpen(false); setSettingsOpen(true); } : undefined} />}{settingsOpen && <ProfileSettings user={sessionUser} workspace={workspace} onChangeWorkspace={value => { changeWorkspace(value); saveProfileSettings({ workspace: value }); }} onClose={() => setSettingsOpen(false)} onSave={async (values) => { const updated = await saveProfileSettings(values); if (updated) { setSessionUser(updated); setWorkspace(updated.workspace || workspace); } setSettingsOpen(false); }} />}</div>}
     </aside>
     <main className="main-content">
-        <header className="topbar"><button className="menu-button" onClick={() => setMenuOpen(true)}><Menu size={20} /></button><div><span className="breadcrumb">OPERATIONS /</span><strong>{section}</strong></div><div className="top-actions"><div className="system-status"><span />All systems operational</div><div className="popover-anchor"><button className="icon-button notification-button" aria-label="Open notifications" onClick={() => { setNotificationsOpen(value => !value); setProfileOpen(false); }}><Bell size={18} />{notifications.some(n => !n.read) && <span>{notifications.filter(n => !n.read).length}</span>}</button>{notificationsOpen && <NotificationMenu notifications={notifications} onRead={markNotificationRead} />}</div><div className="popover-anchor"><button className="top-avatar" aria-label="Open profile" onClick={() => { setProfileOpen(value => !value); setNotificationsOpen(false); }}>{initials(sessionUser.name)}</button>{profileOpen && <ProfileMenu user={sessionUser} logout={logout} />}</div></div></header>
+        <header className="topbar"><button className="menu-button" onClick={() => setMenuOpen(true)}><Menu size={20} /></button><div><span className="breadcrumb">OPERATIONS /</span><strong>{section}</strong></div><div className="top-actions"><div className="system-status"><span />All systems operational</div><div className="popover-anchor notification-popover-anchor"><button className="icon-button notification-button" aria-label="Open notifications" onClick={() => { setNotificationsOpen(value => !value); setProfileOpen(false); }}><Bell size={18} />{notifications.some(n => !n.read) && <span>{notifications.filter(n => !n.read).length}</span>}</button>{notificationsOpen && <NotificationMenu notifications={notifications} onRead={markNotificationRead} />}</div><div className="popover-anchor"><button className="top-avatar" aria-label="Open profile" onClick={() => { setProfileOpen(value => !value); setNotificationsOpen(false); }}>{initials(sessionUser.name)}</button>{profileOpen && <ProfileMenu user={sessionUser} logout={logout} />}</div></div></header>
       {error && <div className="error-banner"><AlertTriangle size={17} />{error}<button onClick={load}>Retry</button></div>}
-        {section === 'Overview' ? <RoleDashboard role={sessionUser.role} dashboard={dashboard} tasks={tasks} run={run} runAgent={runAgent} agentMode={agentMode} userName={sessionUser.name} workspace={workspace} updateTask={updateTask} onNavigate={setSection} /> : canVisit ? <SectionView section={section} dashboard={dashboard} tasks={tasks} vehicles={vehicles} workspace={workspace} run={run} runAgent={runAgent} runCommand={runCommand} agentMode={agentMode} agentState={agentState} canOptimize={sessionUser.role === 'ADMIN'} operator={sessionUser.role === 'OPERATOR'} sessionUser={sessionUser} updateTask={updateTask} createTask={createTask} incidentForm={incidentForm} setIncidentForm={setIncidentForm} incidentStatus={incidentStatus} saveIncident={saveIncident} role={sessionUser.role} /> : <AccessDenied />}
+        {((section === 'Overview' && !['CITIZEN', 'VIEWER'].includes(sessionUser.role)) || (section === 'Home' && ['CITIZEN', 'VIEWER'].includes(sessionUser.role))) ? <RoleDashboard role={sessionUser.role} dashboard={dashboard} tasks={tasks} run={run} runAgent={runAgent} agentMode={agentMode} userName={sessionUser.name} workspace={workspace} updateTask={updateTask} onNavigate={setSection} /> : canVisit ? <SectionView section={section} dashboard={dashboard} tasks={tasks} vehicles={vehicles} workspace={workspace} run={run} runAgent={runAgent} runCommand={runCommand} agentMode={agentMode} agentState={agentState} canOptimize={sessionUser.role === 'ADMIN'} operator={sessionUser.role === 'OPERATOR'} sessionUser={sessionUser} updateTask={updateTask} createTask={createTask} incidentForm={incidentForm} setIncidentForm={setIncidentForm} incidentStatus={incidentStatus} saveIncident={saveIncident} role={sessionUser.role} onNavigate={setSection} notifications={notifications} onReadNotification={markNotificationRead} /> : <AccessDenied />}
       {sessionUser.role === 'OPERATOR' && section === 'Overview' && <OperatorTaskActions tasks={tasks} updateTask={updateTask} />}
-      <button className="chat-launcher" title="Open EcoFlow operations assistant" aria-label="Open EcoFlow operations assistant" onClick={() => setChatOpen(value => !value)}>{chatOpen ? <X size={16} /> : <Bot size={20} />}{!chatOpen && <span className="chat-dot" />}</button>
-      {chatOpen && <ChatPanel messages={chatMessages} input={chatInput} setInput={setChatInput} onSubmit={submitChat} onClose={() => setChatOpen(false)} mode={agentMode} />}
+      {!['VIEWER', 'CITIZEN'].includes(sessionUser.role) && <><button className="chat-launcher" title="Open EcoFlow operations assistant" aria-label="Open EcoFlow operations assistant" onClick={() => setChatOpen(value => !value)}>{chatOpen ? <X size={16} /> : <Bot size={20} />}{!chatOpen && <span className="chat-dot" />}</button>{chatOpen && <ChatPanel messages={chatMessages} input={chatInput} setInput={setChatInput} onSubmit={submitChat} onClose={() => setChatOpen(false)} mode={agentMode} />}</>}
     </main>
   </div>;
 }
 
 function AccessDenied() { return <div className="page"><div className="section-placeholder"><div className="placeholder-icon"><AlertTriangle size={24} /></div><h2>403 - Access denied</h2><p>Your role does not have access to this area.</p></div></div>; }
 function RoleDashboard({ role, dashboard, tasks, run, runAgent, agentMode, userName, workspace, updateTask, onNavigate }) {
-  if (role === 'OPERATOR') return <OperatorDashboard dashboard={dashboard} tasks={tasks} userName={userName} workspace={workspace} updateTask={updateTask} onNavigate={onNavigate} />;
-  if (role === 'VIEWER') return <ViewerDashboard dashboard={dashboard} workspace={workspace} />;
-  return <Overview dashboard={dashboard} tasks={tasks} run={run} runAgent={runAgent} agentMode={agentMode} canOptimize userName={userName} workspace={workspace} onNavigate={onNavigate} />;
+  if (role === 'CITIZEN') return <CitizenDashboard userName={userName} onNavigate={onNavigate} notifications={[]} />;
+  if (!dashboard) return <div className="loading-screen"><div className="spinner" /><span>Loading EcoFlow operations...</span></div>;
+  if (role === 'OPERATOR') return <><OperatorDashboard dashboard={dashboard} tasks={tasks} userName={userName} workspace={workspace} updateTask={updateTask} onNavigate={onNavigate} /><AgentActivityPanel /></>;
+  if (role === 'VIEWER') return <ViewerHome userName={userName} onNavigate={onNavigate} />;
+  return <><Overview dashboard={dashboard} tasks={tasks} run={run} runAgent={runAgent} agentMode={agentMode} canOptimize userName={userName} workspace={workspace} onNavigate={onNavigate} /><AgentActivityPanel /></>;
 }
 function OperatorDashboard({ dashboard, tasks, userName, workspace, updateTask, onNavigate }) {
   const active = tasks.filter(task => ['PENDING', 'ASSIGNED', 'IN_PROGRESS'].includes(task.status));
@@ -202,21 +222,123 @@ function OperatorDashboard({ dashboard, tasks, userName, workspace, updateTask, 
   const actionLabel = task => task.status === 'PENDING' ? 'Accept task' : task.status === 'ASSIGNED' ? 'Start collection' : 'Complete';
   return <div className="page"><div className="page-heading"><div><span className="eyebrow">OPERATOR WORKSPACE</span><h1>Good morning, {userName}<span className="heading-period">.</span></h1><p>Your assigned collections and operational alerts for {workspace}.</p></div><span className="role-badge operator">OPERATOR</span></div><section className="metric-grid">{[['Assigned tasks', active.length], ['In progress', active.filter(task => task.status === 'IN_PROGRESS').length], ['Completed', tasks.filter(task => task.status === 'COMPLETED').length], ['Critical bins', dashboard.metrics.criticalBins]].map(([label, value]) => <div className="metric-card" key={label}><span className="metric-label">{label}</span><strong className="metric-value">{value}</strong><span className="metric-foot">Live operational count</span></div>)}</section><div className="panel tasks-panel"><div className="panel-heading"><div><span className="eyebrow">TODAY&apos;S WORK</span><h2>Assigned collection tasks</h2></div><span className="live-label"><span />MY QUEUE</span></div>{active.length ? active.map(task => <div className="task-row full-task-row" key={task.id}><strong>{task.id}<small>{task.bins.join(' → ')} · {task.priority}</small></strong><span className={`priority ${task.priority.toLowerCase()}`}>{task.priority}</span><span className="route-cell"><Route size={14} />{task.vehicle}<small>{task.distance} km · {task.duration} min</small></span><span className={`task-status ${task.status.toLowerCase()}`}><span />{task.status.replace('_', ' ')}</span><button className="secondary-button" onClick={() => updateTask(task.id, nextAction(task))}>{actionLabel(task)}</button></div>) : <div className="empty-popover">No assigned collection tasks.</div>}</div><div className="lower-grid"><div className="panel bin-panel"><div className="panel-heading"><div><span className="eyebrow">NEARBY RISK</span><h2>Critical bins</h2></div></div><div className="bin-list">{dashboard.bins.filter(bin => bin.priority === 'CRITICAL').slice(0, 5).map(bin => <div className="bin-row" key={bin.id}><div className="bin-status critical"><Layers3 size={17} /></div><div className="bin-meta"><strong>{bin.id}<small>{bin.location}</small></strong><span>{bin.fill}% full · {bin.forecast.hours}h to overflow</span></div></div>)}</div></div><IncidentPanel incidents={dashboard.incidents || []} /></div></div>;
 }
-function ViewerDashboard({ dashboard, workspace }) {
-  return <div className="page"><div className="page-heading"><div><span className="eyebrow">MONITORING VIEW</span><h1>Campus overview<span className="heading-period">.</span></h1><p>Read-only system information for {workspace}.</p></div><span className="role-badge viewer">VIEWER</span></div><section className="metric-grid">{[['Total bins', dashboard.metrics.totalBins], ['Critical bins', dashboard.metrics.criticalBins], ['Collections complete', dashboard.metrics.completedCollections], ['Waste collected', `${dashboard.metrics.totalWasteCollected} kg`]].map(([label, value]) => <div className="metric-card" key={label}><span className="metric-label">{label}</span><strong className="metric-value">{value}</strong><span className="metric-foot">Read-only metric</span></div>)}</section><div className="chart-grid"><div className="panel chart-panel"><div className="panel-heading"><div><span className="eyebrow">SYSTEM TREND</span><h2>Waste generation</h2></div></div><div className="chart-wrap"><ResponsiveContainer width="100%" height="100%"><AreaChart data={dashboard.wasteTrend}><CartesianGrid vertical={false} stroke="#e7edea" /><XAxis dataKey="day" tickLine={false} axisLine={false} /><YAxis tickLine={false} axisLine={false} /><Tooltip /><Area type="monotone" dataKey="total" stroke="#168a77" fill="#dff2e9" /></AreaChart></ResponsiveContainer></div></div><IncidentPanel incidents={dashboard.incidents || []} /></div></div>;
+function ViewerHome({ userName, onNavigate }) {
+  const [reports, setReports] = useState([]);
+  useEffect(() => { let active = true; const load = async () => { try { const response = await fetchJson('/public-reports?mine=true'); if (active) setReports(response.data || []); } catch (_) {} }; load(); const timer = setInterval(load, 5000); return () => { active = false; clearInterval(timer); }; }, []);
+  const active = reports.filter(report => !['RESOLVED', 'CLOSED'].includes(report.status));
+  const resolved = reports.filter(report => ['RESOLVED', 'CLOSED'].includes(report.status));
+  return <div className="page viewer-home"><div className="page-heading"><div><span className="eyebrow">PERSONAL SPACE</span><h1>Welcome, {userName}<span className="heading-period">.</span></h1><p>Report a local waste issue and follow its progress.</p></div><button className="primary-button" onClick={() => onNavigate('Report an Issue')}><Send size={16} />Report an issue</button></div><section className="metric-grid viewer-metrics"><div className="metric-card"><span className="metric-label">Open reports</span><strong className="metric-value">{active.length}</strong><span className="metric-foot">Your submitted reports</span></div><div className="metric-card"><span className="metric-label">Resolved reports</span><strong className="metric-value">{resolved.length}</strong><span className="metric-foot">Issues completed</span></div></section><section className="viewer-welcome panel"><div><span className="eyebrow">YOUR REPORTS</span><h2>Track what you have submitted</h2><p>Every report stays private to your account.</p></div><button className="secondary-button" onClick={() => onNavigate('My Reports')}>View my reports <ChevronRight size={15} /></button></section></div>;
 }
 
+function CitizenDashboard({ userName, onNavigate }) {
+  const [reports, setReports] = useState([]);
+  const [loadingReports, setLoadingReports] = useState(true);
+  const loadReports = async () => { try { setLoadingReports(true); const response = await fetchJson('/public-reports?mine=true'); setReports(response.data || []); } catch (_) {} finally { setLoadingReports(false); } };
+  useEffect(() => { loadReports(); const timer = setInterval(loadReports, 5000); return () => clearInterval(timer); }, []);
+  const active = reports.filter(report => !['RESOLVED', 'CLOSED'].includes(report.status));
+  const resolved = reports.filter(report => ['RESOLVED', 'CLOSED'].includes(report.status));
+  return <div className="page"><div className="page-heading"><div><span className="eyebrow">CITIZEN HOME</span><h1>Welcome to EcoFlow<span className="heading-period">.</span></h1><p>Report waste problems in your area and track their resolution.</p></div><button className="primary-button" onClick={() => onNavigate('Report an Issue')}><Send size={16} />Report an issue</button></div><div className="metric-grid"><div className="metric-card"><span className="metric-label">My active reports</span><strong className="metric-value">{loadingReports ? '...' : active.length}</strong><span className="metric-foot">Backend-tracked</span></div><div className="metric-card"><span className="metric-label">Resolved reports</span><strong className="metric-value">{loadingReports ? '...' : resolved.length}</strong><span className="metric-foot">Verified outcomes</span></div></div><ReportSummary title="My Active Reports" reports={active} empty="You haven't reported any active waste issues yet." onNavigate={onNavigate} /><ReportSummary title="My Resolved Reports" reports={resolved} empty="No reports have been resolved yet." onNavigate={onNavigate} /></div>;
+}
+
+function ReportImage({ src, alt = 'Report photo', className = '' }) { const [failed, setFailed] = useState(!src); if (failed) return <div className={`report-image-placeholder ${className}`} aria-label="Photo unavailable"><ImageOff size={22} /><span>Photo unavailable</span></div>; return <img className={className} src={src} alt={alt} onError={() => setFailed(true)} />; }
+function readableIssue(issueType = '') { return ({ OVERFLOWING_BIN: 'Overflowing waste', GARBAGE_DUMPED_OUTSIDE_BIN: 'Waste outside bin', MISSED_COLLECTION: 'Missed collection', ILLEGAL_DUMPING: 'Illegal dumping', DAMAGED_BIN: 'Damaged bin', OTHER_WASTE_ISSUE: 'Waste issue' }[issueType] || 'Waste issue'); }
+function readableStatus(status = '') { return ({ OPEN: 'Under review', IN_PROGRESS: 'Response in progress', RESOLVED: 'Issue resolved', CLOSED: 'Issue resolved', NO_FLEET_AVAILABLE: 'Response pending', SEVERITY_ASSESSED: 'Report reviewed', TASK_CREATED: 'Response in progress' }[status] || 'Under review'); }
+function readableSeverity(severity = '') { return severity ? `${severity[0]}${severity.slice(1).toLowerCase()} priority` : 'Priority pending'; }
+function formatReportDate(value) { return value ? new Date(value).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : 'Date unavailable'; }
+function ReportSummary({ title, reports, empty, onNavigate }) { return <section className="panel tasks-panel" style={{ marginTop: 18 }}><div className="panel-heading"><div><span className="eyebrow">MY REPORTS</span><h2>{title}</h2></div></div>{reports.length ? reports.slice(0, 5).map(report => <button className="task-row full-task-row" key={report.id} onClick={() => onNavigate('My Reports')}><strong>{report.id}<small>{readableIssue(report.issueType)} · {formatReportDate(report.createdAt || report.timestamp)}</small></strong><span className={`priority ${String(report.severity || 'MEDIUM').toLowerCase()}`}>{readableSeverity(report.severity)}</span><span>{readableStatus(report.status)}</span><ChevronRight size={16} /></button>) : <div className="empty-popover">{empty}</div>}</section>; }
+
 function initials(name = '') { return name.split(' ').map(part => part[0]).join('').slice(0, 2).toUpperCase(); }
+function displayRole(role = '') { return role === 'VIEWER' ? 'USER' : role; }
+function PublicReportLauncher() {
+  const [open, setOpen] = useState(false);
+  return open ? <div className="login-shell" style={{ position: 'fixed', inset: 0, zIndex: 20, overflow: 'auto' }}><PublicReportForm onBack={() => setOpen(false)} /></div> : <button className="primary-button" style={{ position: 'fixed', bottom: 24, right: 24, zIndex: 10 }} onClick={() => setOpen(true)}>Report a waste issue <Send size={16} /></button>;
+}
+function PublicReportForm({ onBack }) {
+  const [form, setForm] = useState({ issueType: 'OVERFLOWING_BIN', description: '', latitude: '17.4401', longitude: '78.3489', photo: '' });
+  const [status, setStatus] = useState('');
+  const [report, setReport] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+  const locate = () => {
+    if (!navigator.geolocation) { setStatus('Location is not supported by this browser. Enter coordinates manually.'); return; }
+    setStatus('Getting your location...');
+    navigator.geolocation.getCurrentPosition(
+      position => { setForm(current => ({ ...current, latitude: position.coords.latitude.toFixed(6), longitude: position.coords.longitude.toFixed(6) })); setStatus('Location updated on the map.'); },
+      error => setStatus(error.code === 1 ? 'Location permission was denied. Allow location access or enter coordinates manually.' : 'Unable to get your location. Enter coordinates manually.'),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
+    );
+  };
+  const choosePhoto = event => { const file = event.target.files?.[0]; if (!file || !file.type.startsWith('image/')) { setStatus('Please choose an image file.'); return; } const reader = new FileReader(); reader.onload = () => setForm(current => ({ ...current, photo: String(reader.result) })); reader.readAsDataURL(file); };
+  const submit = async event => { event.preventDefault(); if (!form.photo || !form.description.trim() || !form.latitude || !form.longitude) { setStatus('Photo, description, and location are required.'); return; } setSubmitting(true); try { setStatus(''); const result = await fetchJson('/public-reports', { method: 'POST', body: JSON.stringify({ ...form, description: form.description.trim(), latitude: Number(form.latitude), longitude: Number(form.longitude), source: 'CITIZEN' }) }); setReport(result.data || result); setStatus('Report submitted successfully'); } catch (error) { setStatus(error.message); } finally { setSubmitting(false); } };
+  useEffect(() => { if (!report?.id || report.status === 'RESOLVED') return undefined; const timer = setInterval(async () => { try { const response = await fetchJson(`/public-reports/${report.id}/status`); setReport(current => ({ ...current, ...response.data })); } catch (_) {} }, 5000); return () => clearInterval(timer); }, [report?.id, report?.status]);
+  if (report) return <section className="login-panel report-submitted"><div className="login-brand"><div className="brand-mark"><Leaf size={20} /></div><div><strong>EcoFlow</strong><span>PERSONAL REPORT</span></div></div><div className="login-copy"><span className="eyebrow">REPORT SUBMITTED</span><h1><CheckCircle2 size={28} /> Report received</h1><p>Report submitted successfully</p></div><div className="report-confirmation"><span>Report ID</span><strong>{report.id}</strong></div><button className="primary-button" onClick={() => onBack(report)}>View details <ChevronRight size={16} /></button><button className="secondary-button" onClick={() => onBack()}>Return to my reports</button></section>;
+  return <section className="login-panel"><div className="login-brand"><div className="brand-mark"><Leaf size={20} /></div><div><strong>EcoFlow</strong><span>PUBLIC REPORT</span></div></div><div className="login-copy"><span className="eyebrow">CITIZEN REPORTING</span><h1>Report a waste issue<span>.</span></h1><p>Submit evidence for backend analysis and operational follow-up.</p></div><form className="login-form" onSubmit={submit}><label>Issue type<select value={form.issueType} onChange={event => setForm(current => ({ ...current, issueType: event.target.value }))}><option value="OVERFLOWING_BIN">Overflowing Bin</option><option value="GARBAGE_DUMPED_OUTSIDE_BIN">Garbage Dumped Outside Bin</option><option value="MISSED_COLLECTION">Missed Collection</option><option value="ILLEGAL_DUMPING">Illegal Dumping</option><option value="DAMAGED_BIN">Damaged Bin</option><option value="OTHER_WASTE_ISSUE">Other Waste Issue</option></select></label><label>Photo evidence<input type="file" accept="image/*" onChange={choosePhoto} required />{form.photo && <img className="report-photo-preview" src={form.photo} alt="Selected report evidence preview" />}</label><label>Description<textarea placeholder="Describe the problem..." value={form.description} onChange={event => setForm(current => ({ ...current, description: event.target.value }))} required /></label><div className="report-location"><span className="eyebrow">LOCATION</span><LocationMap latitude={form.latitude} longitude={form.longitude} /><div className="location-coordinates"><label>Latitude<input type="number" step="any" value={form.latitude} onChange={event => setForm(current => ({ ...current, latitude: event.target.value }))} required /></label><label>Longitude<input type="number" step="any" value={form.longitude} onChange={event => setForm(current => ({ ...current, longitude: event.target.value }))} required /></label></div><button className="secondary-button" type="button" onClick={locate}>Use my location</button></div>{status && <div className="login-error">{status}</div>}<button className="primary-button login-submit" disabled={!form.photo || submitting}>{submitting ? 'Submitting...' : 'Submit report'} <Send size={16} /></button></form><button className="text-button" onClick={onBack}>Return</button></section>;
+}
+
+function LocationMap({ latitude, longitude }) {
+  const mapRef = useRef(null);
+  const markerRef = useRef(null);
+  useEffect(() => {
+    const lat = Number(latitude);
+    const lon = Number(longitude);
+    if (!mapRef.current || !Number.isFinite(lat) || !Number.isFinite(lon)) return undefined;
+    const map = L.map(mapRef.current, { zoomControl: true }).setView([lat, lon], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+    markerRef.current = L.marker([lat, lon]).addTo(map);
+    setTimeout(() => map.invalidateSize(), 0);
+    return () => { map.remove(); markerRef.current = null; };
+  }, []);
+  useEffect(() => {
+    const lat = Number(latitude);
+    const lon = Number(longitude);
+    if (markerRef.current && Number.isFinite(lat) && Number.isFinite(lon)) markerRef.current.setLatLng([lat, lon]);
+  }, [latitude, longitude]);
+  return <div className="report-location-map" ref={mapRef} aria-label="Selected report location map" />;
+}
+
+function CitizenReportsView() {
+  const [reports, setReports] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const load = async () => { try { setLoading(true); setError(''); const response = await fetchJson('/public-reports?mine=true'); setReports(response.data || []); } catch (loadError) { setError(loadError.message || 'Unable to load your reports.'); } finally { setLoading(false); } };
+  useEffect(() => { load(); const timer = setInterval(load, 5000); return () => clearInterval(timer); }, []);
+  if (loading) return <div className="loading-screen"><div className="spinner" /><span>Loading your reports...</span></div>;
+  return <div className="page"><div className="page-heading"><div><span className="eyebrow">PERSONAL REPORTS</span><h1>My Reports<span className="heading-period">.</span></h1><p>Private updates for the waste issues you submitted.</p></div></div>{error && <div className="error-banner"><AlertTriangle size={17} />{error}<button onClick={load}>Retry</button></div>}{reports.length ? <div className="personal-report-grid">{reports.map(report => <button className="personal-report-card" key={report.id} onClick={() => setSelected(report)}><ReportImage src={report.photo} alt="Uploaded waste report" className="personal-report-photo" /><div className="personal-report-content"><div className="personal-report-topline"><span className="report-id">{report.id}</span><span className={`personal-status ${String(report.status || 'OPEN').toLowerCase()}`}>{readableStatus(report.status)}</span></div><h2>{readableIssue(report.issueType)}</h2><p className="personal-report-description">{report.description || 'No description provided.'}</p><div className="personal-report-meta"><span>Reported {formatReportDate(report.createdAt || report.timestamp)}</span><span>{readableSeverity(report.severity)}</span></div><span className="personal-report-action">View details <ChevronRight size={15} /></span></div></button>)}</div> : !error && <div className="section-placeholder"><h2>No reports yet</h2><p>Your submitted waste issues will appear here.</p></div>}{selected && <CitizenReportDetail report={selected} onClose={() => setSelected(null)} />}</div>;
+}
+
+function CitizenReportDetail({ report, onClose }) {
+  const [detail, setDetail] = useState(report);
+  useEffect(() => { let active = true; fetchJson(`/public-reports/${report.id}/status`).then(response => { if (active) setDetail(current => ({ ...current, ...response.data })); }).catch(() => {}); return () => { active = false; }; }, [report.id, report.status]);
+  const timeline = detail.timeline || [];
+  const reviewed = timeline.some(item => ['REPORT_ANALYZED', 'SEVERITY_ASSESSED'].includes(item.action));
+  const responding = ['IN_PROGRESS', 'RESOLVED', 'CLOSED'].includes(detail.status) || timeline.some(item => ['TASK_CREATED', 'TASK_DISPATCHED'].includes(item.action));
+  const resolved = ['RESOLVED', 'CLOSED'].includes(detail.status);
+  const steps = [['submitted', 'Report submitted', true], ['reviewed', 'Report reviewed', reviewed || responding || resolved], ['response', 'Response in progress', responding], ['resolved', 'Issue resolved', resolved]];
+  return <div className="detail-drawer personal-report-detail"><button className="icon-button" onClick={onClose} aria-label="Close report"><X size={16} /></button><span className="eyebrow">YOUR REPORT</span><h2>Report #{detail.id}</h2><ReportImage src={detail.photo} alt="Uploaded waste report" className="report-detail-photo" /><div className="personal-detail-copy"><p><strong>Issue</strong>{readableIssue(detail.issueType)}</p><p><strong>Description</strong>{detail.description || 'No description provided.'}</p><p><strong>Location</strong>{detail.latitude != null && detail.longitude != null ? `${detail.latitude}, ${detail.longitude}` : 'Not available'}</p><p><strong>Reported</strong>{detail.createdAt || detail.timestamp ? new Date(detail.createdAt || detail.timestamp).toLocaleString() : 'Date unavailable'}</p><p><strong>Status</strong><span className="personal-status">{readableStatus(detail.status || detail.currentAction)}</span></p></div>{resolved && <div className="task-success"><strong>Your reported issue has been resolved.</strong>{detail.resolutionDetails && <span>{detail.resolutionDetails}</span>}</div>}<div className="personal-timeline"><span className="eyebrow">STATUS TIMELINE</span>{steps.map(([key, label, complete], index) => <div className="personal-timeline-item" key={key}><span className={complete ? 'timeline-check complete' : index === steps.findIndex(step => !step[2]) ? 'timeline-check current' : 'timeline-check'}>{complete ? '✓' : index === steps.findIndex(step => !step[2]) ? '●' : '○'}</span><span>{label}</span></div>)}</div></div>;
+}
+
+function CitizenNotificationsView() {
+  const [notifications, setNotifications] = useState([]);
+  const [selectedReport, setSelectedReport] = useState(null);
+  const load = async () => { try { setNotifications(await fetchJson('/notifications')); } catch (_) {} };
+  useEffect(() => { load(); const timer = setInterval(load, 5000); return () => clearInterval(timer); }, []);
+  const openNotification = async notification => { try { await fetchJson(`/notifications/${notification.id}/read`, { method: 'PATCH' }); if (notification.reportId) { const response = await fetchJson(`/public-reports/${notification.reportId}/status`); setSelectedReport(response.data); } load(); } catch (_) {} };
+  return <div className="page"><div className="page-heading"><div><span className="eyebrow">CITIZEN UPDATES</span><h1>Notifications<span className="heading-period">.</span></h1><p>Updates about your submitted reports.</p></div></div><NotificationPage notifications={notifications} onRead={openNotification} />{selectedReport && <CitizenReportDetail report={selectedReport} onClose={() => setSelectedReport(null)} />}</div>;
+}
+
+function NotificationPage({ notifications, onRead }) { return <div className="panel tasks-panel">{notifications.length ? notifications.map(notification => <button className={notification.read ? 'notice read' : 'notice'} key={notification.id} onClick={() => onRead(notification)}><div className="notice-icon"><Bell size={14} /></div><div><strong>{notification.title}</strong><span>{notification.body}</span><small>{notification.time}</small></div>{!notification.read && <Check size={14} />}</button>) : <div className="empty-popover">No notifications yet.</div>}</div>; }
 function LoginScreen({ onLogin, error }) {
   const [email, setEmail] = useState('saiganesh@gmail.com');
   const [password, setPassword] = useState('ultron2026');
   const [submitting, setSubmitting] = useState(false);
+  const [reporting, setReporting] = useState(false);
   const submit = async event => { event.preventDefault(); setSubmitting(true); await onLogin(email, password); setSubmitting(false); };
   const choose = (account, accountPassword) => { setEmail(account); setPassword(accountPassword); };
+  if (reporting) return <main className="login-shell"><PublicReportForm onBack={() => setReporting(false)} /><aside className="login-aside"><div className="login-aside-content"><span className="eyebrow">PUBLIC REPORTING</span><h2>Report once. Track the response.</h2><p>Your report is analyzed by the existing EcoFlow operations agent and linked to the verified fleet workflow.</p></div></aside></main>;
   return <main className="login-shell"><section className="login-panel"><div className="login-brand"><div className="brand-mark"><Leaf size={20} /></div><div><strong>EcoFlow</strong><span>AI OPERATIONS</span></div></div><div className="login-copy"><span className="eyebrow">SECURE OPERATIONS ACCESS</span><h1>Welcome back<span>.</span></h1><p>Sign in to monitor waste intelligence and coordinate your campus operations.</p></div><form className="login-form" onSubmit={submit}><label>Email address<input type="email" value={email} onChange={event => setEmail(event.target.value)} autoComplete="username" required /></label><label>Password<input type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete="current-password" required /></label>{error && <div className="login-error"><AlertTriangle size={15} />{error}</div>}<button className="primary-button login-submit" disabled={submitting}>{submitting ? 'Signing in...' : 'Sign in to EcoFlow'}<ChevronRight size={16} /></button></form><div className="demo-access"><span className="eyebrow">DEMO ACCESS</span><div className="demo-options"><button onClick={() => choose('saiganesh@gmail.com', 'ultron2026')}><strong>Admin</strong><small>Full operational control</small></button><button onClick={() => choose('bhanu@gmail.com', 'ultron2026')}><strong>Operator</strong><small>Field task access</small></button><button onClick={() => choose('user@gmail.com', '123456')}><strong>Viewer</strong><small>Read-only analytics</small></button></div></div></section><aside className="login-aside"><div className="login-aside-content"><span className="eyebrow">AUTONOMOUS WASTE INTELLIGENCE</span><h2>Know what happens next.</h2><p>EcoFlow observes your campus, predicts overflow, and turns live signals into verified collection decisions.</p><div className="login-proof"><div><strong>24</strong><span>Connected bins</span></div><div><strong>87</strong><span>Eco score</span></div><div><strong>91%</strong><span>Route efficiency</span></div></div></div></aside></main>;
 }
 function OperatorTaskActions({ tasks, updateTask }) { const assigned = tasks.filter(task => ['PENDING', 'ASSIGNED', 'IN_PROGRESS'].includes(task.status)); return <div className="operator-actions"><div><span className="eyebrow">OPERATOR CONSOLE</span><strong>Assigned collection actions</strong></div>{assigned.slice(0, 3).map(task => <div className="operator-task" key={task.id}><div><strong>{task.id}</strong><span>{task.bins.join(' → ')} · {task.vehicle}</span></div>{task.status === 'IN_PROGRESS' ? <button className="secondary-button" onClick={() => updateTask(task.id, 'COMPLETED')}><CheckCircle2 size={14} />Complete</button> : <button className="secondary-button" onClick={() => updateTask(task.id, task.status === 'PENDING' ? 'ASSIGNED' : 'IN_PROGRESS')}><Truck size={14} />{task.status === 'PENDING' ? 'Accept task' : 'Start task'}</button>}</div>)}</div>; }
-function ProfileMenu({ user, logout, onOpenSettings }) { return <div className="profile-menu popover"><div className="profile-heading"><div className="avatar">{initials(user.name)}</div><div><strong>{user.name}</strong><span>{user.role} · {user.email}</span></div></div>{onOpenSettings && <button onClick={onOpenSettings}><UserRound size={15} />Profile settings</button>}<button onClick={logout}><LogOut size={15} />Sign out</button></div>; }
+function ProfileMenu({ user, logout, onOpenSettings }) { return <div className="profile-menu popover"><div className="profile-heading"><div className="avatar">{initials(user.name)}</div><div><strong>{user.name}</strong><span>{displayRole(user.role)} · {user.email}</span></div></div>{onOpenSettings && <button onClick={onOpenSettings}><UserRound size={15} />Profile settings</button>}<button onClick={logout}><LogOut size={15} />Sign out</button></div>; }
 function ProfileSettings({ user, workspace, onChangeWorkspace, onClose, onSave }) {
   const [localWorkspace, setLocalWorkspace] = useState(workspace);
   const [notifications, setNotifications] = useState(true);
@@ -236,9 +358,9 @@ function ProfileSettings({ user, workspace, onChangeWorkspace, onClose, onSave }
     onSave({ workspace: localWorkspace, notifications, autoRefresh });
   };
 
-  return <div className="profile-menu popover settings-panel"><div className="profile-heading"><div className="avatar">{initials(user.name)}</div><div><strong>{user.name}</strong><span>{user.role} · {user.email}</span></div></div><div className="panel-heading"><div><span className="eyebrow">PROFILE SETTINGS</span><h2>Preferences</h2></div><button className="icon-button" onClick={onClose} aria-label="Close settings"><X size={15} /></button></div><div className="settings-list"><label className="settings-field"><span>Workspace</span><select value={localWorkspace} onChange={event => setLocalWorkspace(event.target.value)}><option value="Hyderabad Operations">Hyderabad Operations</option></select></label><label className="settings-field"><span>Notifications</span><input type="checkbox" checked={notifications} onChange={event => setNotifications(event.target.checked)} /></label><label className="settings-field"><span>Auto-refresh</span><input type="checkbox" checked={autoRefresh} onChange={event => setAutoRefresh(event.target.checked)} /></label></div><button className="primary-button" onClick={save}>Save changes</button></div>;
+  return <div className="profile-menu popover settings-panel"><div className="profile-heading"><div className="avatar">{initials(user.name)}</div><div><strong>{user.name}</strong><span>{displayRole(user.role)} · {user.email}</span></div></div><div className="panel-heading"><div><span className="eyebrow">PROFILE SETTINGS</span><h2>Preferences</h2></div><button className="icon-button" onClick={onClose} aria-label="Close settings"><X size={15} /></button></div><div className="settings-list"><label className="settings-field"><span>City</span><select value={localWorkspace} onChange={event => setLocalWorkspace(event.target.value)}>{SUPPORTED_WORKSPACES.map(option => <option value={option} key={option}>{option.replace(' Operations', '')}</option>)}</select></label><label className="settings-field"><span>Notifications</span><input type="checkbox" checked={notifications} onChange={event => setNotifications(event.target.checked)} /></label><label className="settings-field"><span>Auto-refresh</span><input type="checkbox" checked={autoRefresh} onChange={event => setAutoRefresh(event.target.checked)} /></label></div><button className="primary-button" onClick={save}>Save changes</button></div>;
 }
-function WorkspaceMenu({ current, onChange }) { return <div className="workspace-menu"><span className="workspace-menu-label">SELECT WORKSPACE</span>{['Hyderabad Operations'].map(option => <button className={current === option ? 'workspace-option selected' : 'workspace-option'} key={option} onClick={() => onChange(option)}><span className="workspace-dot" />{option}{current === option && <Check size={14} />}</button>)}</div>; }
+function WorkspaceMenu({ current, onChange }) { return <div className="workspace-menu"><span className="workspace-menu-label">SELECT CITY</span>{SUPPORTED_WORKSPACES.map(option => <button className={current === option ? 'workspace-option selected' : 'workspace-option'} key={option} onClick={() => onChange(option)}><span className="workspace-dot" />{option.replace(' Operations', '')}{current === option && <Check size={14} />}</button>)}</div>; }
 function NotificationMenu({ notifications, onRead }) { return <div className="notification-menu popover"><div className="popover-title"><strong>Notifications</strong><span>{notifications.filter(item => !item.read).length} unread</span></div>{notifications.length ? notifications.slice(0, 5).map(notification => <button className={notification.read ? 'notice read' : 'notice'} key={notification.id} onClick={() => onRead(notification)}><div className="notice-icon"><Bell size={14} /></div><div><strong>{notification.title}</strong><span>{notification.body}</span><small>{notification.time}</small></div>{!notification.read && <Check size={14} />}</button>) : <div className="empty-popover">You&apos;re all caught up.</div>}</div>; }
 function ChatPanel({ messages, input, setInput, onSubmit, onClose, mode }) { return <section className="chat-panel"><div className="chat-header"><div className="chat-agent-icon"><Bot size={17} /></div><div><strong>EcoFlow assistant</strong><span>Hyderabad live operations · {mode === 'LLM' ? 'OpenAI LLM' : 'validated local engine'}</span></div><button onClick={onClose}><X size={16} /></button></div><div className="chat-messages">{messages.map((message, index) => <div className={`chat-message ${message.role} ${message.error ? 'chat-error' : ''}`} key={`${message.role}-${index}`}>{message.role === 'agent' && <Bot size={14} /> }<div>{message.run ? <OperationCard run={message.run} compact /> : <p>{message.text}</p>}</div></div>)}</div><form className="chat-form" onSubmit={onSubmit}><input value={input} onChange={event => setInput(event.target.value)} placeholder="Ask about bins, routes, or dispatch..." aria-label="Ask EcoFlow assistant" /><button type="submit" aria-label="Send message"><Send size={16} /></button></form></section>; }
 
@@ -256,10 +378,16 @@ function ChatPanel({ messages, input, setInput, onSubmit, onClose, mode }) { ret
   </div>;
 }
 
-function SectionView({ section, dashboard, tasks, vehicles, workspace, run, runAgent, runCommand, agentMode, agentState, canOptimize, operator, sessionUser, updateTask, createTask, incidentForm, setIncidentForm, incidentStatus, saveIncident, role }) {
-  if (section === 'Bin Monitoring') return <>{<BinMonitoring dashboard={dashboard} workspace={workspace} />} {role === 'ADMIN' && <BinAdminControls bins={dashboard.bins} />}</>;
+function SectionView({ section, dashboard, tasks, vehicles, workspace, run, runAgent, runCommand, agentMode, agentState, canOptimize, operator, sessionUser, updateTask, createTask, incidentForm, setIncidentForm, incidentStatus, saveIncident, role, onNavigate, notifications, onReadNotification }) {
+  if (section === 'Report an Issue') return <div className="page"><PublicReportForm onBack={report => onNavigate(report ? 'My Reports' : role === 'CITIZEN' ? 'Home' : 'Overview')} /></div>;
+  if (section === 'My Reports') return <CitizenReportsView />;
+  if (['CITIZEN', 'VIEWER'].includes(role)) {
+    if (section === 'Notifications') return <CitizenNotificationsView />;
+    if (section === 'Profile') return <div className="page"><div className="panel"><span className="eyebrow">PROFILE</span><h2>{sessionUser.name}</h2><p>{sessionUser.email}</p></div></div>;
+  }
+  if (section === 'Bin Monitoring') return <>{role === 'ADMIN' && <SimulatorControls />}<LiveSensorTable bins={dashboard.bins} /><BinMonitoring dashboard={dashboard} workspace={workspace} />{role === 'ADMIN' && <BinAdminControls bins={dashboard.bins} />}</>;
   if (section === 'Collection Tasks') return <CollectionTasks tasks={tasks} operator={operator} admin={role === 'ADMIN'} sessionUser={sessionUser} updateTask={updateTask} createTask={createTask} />;
-  if (section === 'Routes') return <RoutesView admin={role === 'ADMIN'} operator={operator} />;
+  if (section === 'Routes' || section === 'My Routes') return <RoutesView admin={role === 'ADMIN'} operator={operator} />;
   if (section === 'Locations') return <LocationsView />;
   if (section === 'Fleet') return <>{<FleetView vehicles={vehicles} admin={role === 'ADMIN'} />} {role === 'ADMIN' && <VehicleAdminControls />}</>;
   if (section === 'Drivers') return <DriversView admin={role === 'ADMIN'} />;
@@ -267,8 +395,11 @@ function SectionView({ section, dashboard, tasks, vehicles, workspace, run, runA
   if (section === 'Map') return <MapView dashboard={dashboard} vehicles={vehicles} tasks={tasks} workspace={workspace} />;
   if (section === 'Analytics') return <DynamicAnalyticsView dashboard={dashboard} />;
   if (section === 'Users') return <UsersView />;
-  if (section === 'Alerts') return <>{<AlertsView role={role} />} {operator && <IncidentReportForm />}</>;
-  if (section === 'Reports') return <ReportsView />;
+  if (section === 'Alerts') return <AlertsView role={role} />;
+  if (section === 'Reports' || section === 'Public Reports') return <ReportsView />;
+  if (section === 'Agent Activity') return <AgentsView />;
+  if (section === 'Fleet Status') return <FleetView vehicles={vehicles} admin={false} />;
+  if (section === 'Notifications') return role === 'VIEWER' ? <CitizenNotificationsView /> : <NotificationPage notifications={notifications} onRead={onReadNotification} />;
   if (section === 'Audit Logs') return <AuditView />;
   if (section === 'Settings') return <SettingsView admin={role === 'ADMIN'} />;
 
@@ -295,7 +426,117 @@ function SectionView({ section, dashboard, tasks, vehicles, workspace, run, runA
     const update = async (id, status) => { try { await fetchJson(`/alerts/${id}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }); await loadAlerts(); } catch (err) { setError(err.message); } };
     return <div className="page"><div className="page-heading"><div><span className="eyebrow">OPERATIONAL SIGNALS</span><h1>Alerts<span className="heading-period">.</span></h1><p>{role === 'ADMIN' ? 'Review and resolve all operational alerts.' : role === 'OPERATOR' ? 'Acknowledge alerts relevant to your assigned work.' : 'Read-only operational alerts and incidents.'}</p></div></div>{error && <div className="error-banner"><AlertTriangle size={17} />{error}</div>}<IncidentPanel incidents={alerts} />{alerts.map(alert => <div className="alert-actions" key={alert.id}><strong>{alert.id}</strong><span>{alert.status}</span>{role !== 'VIEWER' && alert.status !== 'RESOLVED' && <><button className="secondary-button" onClick={() => update(alert.id, role === 'ADMIN' ? 'RESOLVED' : 'ACKNOWLEDGED')}>{role === 'ADMIN' ? 'Resolve' : 'Acknowledge'}</button></>}</div>)}</div>;
   }
-  function ReportsView() { const [report, setReport] = useState(null); const [error, setError] = useState(''); useEffect(() => { fetchJson('/reports').then(setReport).catch(err => setError(err.message)); }, []); if (error) return <AccessDenied />; if (!report) return <div className="loading-screen"><div className="spinner" /><span>Loading report...</span></div>; return <div className="page"><div className="page-heading"><div><span className="eyebrow">REPORTING</span><h1>Reports<span className="heading-period">.</span></h1><p>Operational summary generated from live records.</p></div></div><section className="metric-grid">{[['Waste collected', `${report.metrics.totalWasteCollected} kg`], ['Completed collections', report.metrics.completedCollections], ['Route efficiency', `${report.metrics.routeEfficiency}%`], ['Recycling rate', `${report.metrics.recyclingRate}%`]].map(([label, value]) => <div className="metric-card" key={label}><span className="metric-label">{label}</span><strong className="metric-value">{value}</strong></div>)}</section></div>; }
+  function ReportsView() {
+    const [reports, setReports] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState('');
+
+    useEffect(() => {
+      const load = async () => {
+        try {
+          setLoading(true);
+          const response = await fetchJson('/public-reports');
+          setReports(response.data || []);
+        } catch (err) {
+          setError(err.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+      load();
+    }, []);
+
+    if (error) return <AccessDenied />;
+    if (loading) return <div className="loading-screen"><div className="spinner" /><span>Loading reports...</span></div>;
+
+    const openReports = reports.filter(report => !['RESOLVED', 'CLOSED'].includes(report.status || 'OPEN')).length;
+    const checkins = reports.filter(report => report.source === 'CITIZEN').length;
+
+    return (
+      <div className="page">
+        <div className="page-heading">
+          <div>
+            <span className="eyebrow">REPORTING</span>
+            <h1>Public reports<span className="heading-period">.</span></h1>
+            <p>Citizen-submitted observations and operational follow-up from the Hyderabad network.</p>
+          </div>
+        </div>
+
+        <section className="metric-grid">
+          {[
+            ['Open reports', openReports],
+            ['Citizen submissions', checkins],
+            ['Total photos', reports.filter(report => report.photo).length],
+            ['Resolved', reports.filter(report => report.status === 'RESOLVED').length]
+          ].map(([label, value]) => (
+            <div className="metric-card" key={label}>
+              <span className="metric-label">{label}</span>
+              <strong className="metric-value">{value}</strong>
+            </div>
+          ))}
+        </section>
+
+        <div className="analytics-grid">
+          <div className="panel analytics-chart">
+            <div className="panel-heading">
+              <div>
+                <span className="eyebrow">PUBLIC SIGNALS</span>
+                <h2>Report queue</h2>
+              </div>
+            </div>
+            <div className="task-table">
+              {reports.length ? reports.slice(0, 8).map(report => (
+                <div className="task-row full-task-row" key={report.id}>
+                  <strong>{report.id}<small>{report.location || 'Unknown location'}</small></strong>
+                  <span className={`priority ${String(report.severity || 'MEDIUM').toLowerCase()}`}>{report.severity || 'MEDIUM'}</span>
+                  <span className="route-cell">
+                    <Radio size={14} />{report.issueType || report.type || 'Waste concern'}
+                    <small>{report.description || 'No additional details provided.'}</small>
+                  </span>
+                  <span className={`task-status ${(report.status || 'OPEN').toLowerCase()}`}><span />{report.status || 'OPEN'}</span>
+                  <span className="route-cell"><small>{report.currentAction || 'Awaiting agent'}</small>{report.resolvedAt ? `Resolved ${new Date(report.resolvedAt).toLocaleTimeString()}` : report.taskId ? `Task ${report.taskId}` : 'No task assigned'}</span>
+                  {report.photo ? (
+                    <img src={report.photo} alt="Citizen report evidence" style={{ maxWidth: 120, height: 70, objectFit: 'cover', borderRadius: 10, border: '1px solid rgba(19, 51, 43, 0.12)' }} />
+                  ) : (
+                    <div className="empty-popover" style={{ width: 120 }}>No photo</div>
+                  )}
+                </div>
+              )) : (
+                <div className="empty-popover">No public reports have been submitted.</div>
+              )}
+            </div>
+          </div>
+
+          <div className="panel impact-panel">
+            <div className="panel-heading">
+              <div>
+                <span className="eyebrow">RESPONSE SUMMARY</span>
+                <h2>Latest citizen insight</h2>
+              </div>
+            </div>
+            {reports[0] ? (
+              <>
+                <div className="impact-row">
+                  <strong>{reports[0].issueType || 'Overflow concern'}</strong>
+                  <span>Most recent report<br /><small>{reports[0].location || 'Hyderabad'}</small></span>
+                </div>
+                <div className="impact-row">
+                  <strong>{reports[0].source || 'CITIZEN'}</strong>
+                  <span>Source<br /><small>{reports[0].timestamp ? new Date(reports[0].timestamp).toLocaleString() : 'Live intake'}</small></span>
+                </div>
+                <div className="impact-row">
+                  <strong>{reports[0].linkedBinId || 'Unlinked'}</strong>
+                  <span>Linked bin<br /><small>{reports[0].confidence ? `${Math.round(reports[0].confidence * 100)}% confidence` : 'Needs operator review'}</small></span>
+                </div>
+              </>
+            ) : (
+              <div className="empty-popover">No live public reports yet.</div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
   function AuditView() {
     const [logs, setLogs] = useState([]); const [query, setQuery] = useState(''); const [roleFilter, setRoleFilter] = useState('ALL'); const [error, setError] = useState('');
     useEffect(() => { fetchJson('/audit-logs').then(setLogs).catch(err => setError(err.message)); }, []);
@@ -310,12 +551,6 @@ function SectionView({ section, dashboard, tasks, vehicles, workspace, run, runA
     const reset = async () => { if (!window.confirm('Reset operational settings to defaults?')) return; try { setSettings(await fetchJson('/settings/reset', { method: 'POST' })); setMessage('Settings reset to defaults.'); } catch (error) { setMessage(error.message); } };
     if (!settings) return <div className="loading-screen"><div className="spinner" /><span>Loading system settings...</span></div>;
     return <div className="page"><div className="page-heading"><div><span className="eyebrow">SYSTEM CONTROL</span><h1>Settings<span className="heading-period">.</span></h1><p>{admin ? 'Configure operational thresholds and notifications.' : 'Read-only operational configuration for Hyderabad.'}</p></div><span className={`role-badge ${admin ? 'admin' : 'viewer'}`}>{admin ? 'ADMIN EDITOR' : 'READ ONLY'}</span></div>{message && <div className="task-success">{message}</div>}<form className="panel settings-list" onSubmit={save}><div className="panel-heading"><div><span className="eyebrow">GENERAL</span><h2>{settings.organizationName}</h2></div></div><label className="settings-field"><span>Organization name</span><input disabled={!admin} value={settings.organizationName} onChange={event => setSettings(current => ({ ...current, organizationName: event.target.value }))} /></label><label className="settings-field"><span>Operating city</span><input disabled value={settings.operatingCity} /></label><label className="settings-field"><span>Overflow threshold (%)</span><input disabled={!admin} type="number" min="1" max="100" value={settings.overflowThreshold} onChange={event => setSettings(current => ({ ...current, overflowThreshold: event.target.value }))} /></label><label className="settings-field"><span>Vehicle load warning (%)</span><input disabled={!admin} type="number" min="1" max="100" value={settings.vehicleLoadWarning} onChange={event => setSettings(current => ({ ...current, vehicleLoadWarning: event.target.value }))} /></label><label className="settings-field"><span>Critical alerts</span><input disabled={!admin} type="checkbox" checked={settings.criticalAlerts} onChange={event => setSettings(current => ({ ...current, criticalAlerts: event.target.checked }))} /></label><label className="settings-field"><span>Vehicle alerts</span><input disabled={!admin} type="checkbox" checked={settings.vehicleAlerts} onChange={event => setSettings(current => ({ ...current, vehicleAlerts: event.target.checked }))} /></label><label className="settings-field"><span>Task alerts</span><input disabled={!admin} type="checkbox" checked={settings.taskAlerts} onChange={event => setSettings(current => ({ ...current, taskAlerts: event.target.checked }))} /></label><div><strong>System</strong><p>Backend connected · In-memory demo persistence · Version {settings.version}</p></div>{admin && <div className="route-actions"><button className="primary-button" type="submit">Save settings</button><button className="secondary-button" type="button" onClick={reset}>Reset defaults</button></div>}</form></div>;
-  }
-  function IncidentReportForm() {
-    const [form, setForm] = useState({ location: '', wasteType: 'Mixed', severity: 'MEDIUM', description: '' });
-    const [message, setMessage] = useState('');
-    const submit = async event => { event.preventDefault(); try { await fetchJson('/incidents', { method: 'POST', body: JSON.stringify(form) }); setForm({ location: '', wasteType: 'Mixed', severity: 'MEDIUM', description: '' }); setMessage('Issue reported to operations.'); } catch (error) { setMessage(error.message); } };
-    return <div className="panel" style={{ marginTop: 20 }}><div className="panel-heading"><div><span className="eyebrow">FIELD REPORT</span><h2>Report a problem</h2></div></div><form className="incident-form" onSubmit={submit}><label>Location<input value={form.location} onChange={event => setForm(current => ({ ...current, location: event.target.value }))} required /></label><label>Issue type<select value={form.wasteType} onChange={event => setForm(current => ({ ...current, wasteType: event.target.value }))}><option>Mixed</option><option>Organic</option><option>Plastic</option><option>Damaged bin</option><option>Blocked access</option></select></label><label>Severity<select value={form.severity} onChange={event => setForm(current => ({ ...current, severity: event.target.value }))}><option>LOW</option><option>MEDIUM</option><option>HIGH</option><option>CRITICAL</option></select></label><label>Description<textarea value={form.description} onChange={event => setForm(current => ({ ...current, description: event.target.value }))} required /></label><button className="primary-button" type="submit">Report issue</button></form>{message && <div className="task-success">{message}</div>}</div>;
   }
   if (section === 'AI Command Center') return <AICommandCenterView dashboard={dashboard} run={run} runAgent={runAgent} runCommand={runCommand} agentMode={agentMode} agentState={agentState} incidents={dashboard?.incidents || []} incidentForm={incidentForm} setIncidentForm={setIncidentForm} incidentStatus={incidentStatus} saveIncident={saveIncident} />;
   const title = section === 'AI Command Center' ? 'AI command center' : section;
@@ -363,7 +598,7 @@ function QuickCommands({ onCommand, disabled }) {
 function AICommandCenterView({ dashboard, run, runAgent, runCommand, agentMode, agentState, incidents, incidentForm, setIncidentForm, incidentStatus, saveIncident }) {
   const isWorking = run?.loading;
   const status = run?.error ? 'ERROR' : agentState || run?.agentStatus || run?.state || 'OFFLINE';
-  return <div className="page"><div className="page-heading"><div><span className="eyebrow">ECOSYSTEM CONTROL · HYDERABAD</span><h1>AI command center<span className="heading-period">.</span></h1><p>Live autonomous waste operations with verified backend actions.</p></div><button className="primary-button" onClick={runAgent} disabled={isWorking}><Bot size={17} />{isWorking ? 'Agent working...' : 'Run autonomous optimization'}</button></div><QuickCommands onCommand={runCommand} disabled={isWorking} /><div className="command-layout"><div className={`command-status command-status-${status.toLowerCase()}`}><div className="online-orb"><Bot size={31} /></div><span className="status-kicker">AGENT STATUS</span><h2>{status}</h2><p>{isWorking ? 'Analyzing live Hyderabad operations...' : `Monitoring ${dashboard.metrics.totalBins} bins, ${dashboard.metrics.availableVehicles} available vehicles, and active collection tasks.`}</p><div className="status-pills"><span><CheckCircle2 size={14} />Observe</span><span><CheckCircle2 size={14} />Analyze</span><span><CheckCircle2 size={14} />Decide</span><span><CheckCircle2 size={14} />Verify</span></div></div><OperationCard run={run} dashboard={dashboard} /></div><div className="panel" style={{ marginTop: 20 }}><div className="panel-heading"><div><span className="eyebrow">INCIDENT REPORT</span><h2>Submit waste issue</h2></div></div><form className="incident-form" onSubmit={saveIncident}><label>Location<input value={incidentForm.location} onChange={event => setIncidentForm(c => ({ ...c, location: event.target.value }))} required /></label><label>Issue type<select value={incidentForm.wasteType} onChange={event => setIncidentForm(c => ({ ...c, wasteType: event.target.value }))}><option>Mixed</option><option>Organic</option><option>Plastic</option></select></label><label>Severity<select value={incidentForm.severity} onChange={event => setIncidentForm(c => ({ ...c, severity: event.target.value }))}><option>LOW</option><option>MEDIUM</option><option>HIGH</option><option>CRITICAL</option></select></label><label>Description<textarea value={incidentForm.description} onChange={event => setIncidentForm(c => ({ ...c, description: event.target.value }))} required /></label><button className="primary-button" type="submit">Submit incident</button></form>{incidentStatus.message && <div className={incidentStatus.type === 'error' ? 'login-error' : 'task-success'}>{incidentStatus.message}</div>}</div></div>;
+  return <div className="page"><div className="page-heading"><div><span className="eyebrow">ECOSYSTEM CONTROL · HYDERABAD</span><h1>AI command center<span className="heading-period">.</span></h1><p>Live autonomous waste operations with verified backend actions.</p></div><button className="primary-button" onClick={runAgent} disabled={isWorking}><Bot size={17} />{isWorking ? 'Agent working...' : 'Run autonomous optimization'}</button></div><QuickCommands onCommand={runCommand} disabled={isWorking} /><div className="command-layout"><div className={`command-status command-status-${status.toLowerCase()}`}><div className="online-orb"><Bot size={31} /></div><span className="status-kicker">AGENT STATUS</span><h2>{status}</h2><p>{isWorking ? 'Analyzing live Hyderabad operations...' : `Monitoring ${dashboard.metrics.totalBins} bins, ${dashboard.metrics.availableVehicles} available vehicles, and active collection tasks.`}</p><div className="status-pills"><span><CheckCircle2 size={14} />Observe</span><span><CheckCircle2 size={14} />Analyze</span><span><CheckCircle2 size={14} />Decide</span><span><CheckCircle2 size={14} />Verify</span></div></div><OperationCard run={run} dashboard={dashboard} /></div></div>;
 }
 
 function AICommandCenter({ dashboard, run, runAgent, agentMode, incidents, incidentForm, setIncidentForm, incidentStatus, saveIncident }) {
@@ -373,20 +608,48 @@ function AICommandCenter({ dashboard, run, runAgent, agentMode, incidents, incid
 
 function MapView({ dashboard, vehicles, tasks, workspace }) {
   const bins = dashboard.bins || [];
-  const mapRef = useRef(null);
+  const city = CITY_CONFIG[workspace] || CITY_CONFIG['Hyderabad Operations'];
+  const mapContainerRef = useRef(null);
+  const mapInstanceRef = useRef(null);
+  const layersRef = useRef(null);
+
   useEffect(() => {
-    const map = L.map(mapRef.current).setView([17.3850, 78.4867], 11);
-    mapRef.current._leaflet_map = map;
+    const container = mapContainerRef.current;
+    if (!container) return undefined;
+    const map = L.map(container, { zoomControl: true }).setView([city.latitude, city.longitude], city.zoom);
+    mapInstanceRef.current = map;
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+    layersRef.current = L.layerGroup().addTo(map);
+    const resizeMap = () => map.invalidateSize({ pan: false });
+    const resizeFrame = requestAnimationFrame(resizeMap);
+    const resizeTimer = window.setTimeout(resizeMap, 120);
+    window.addEventListener('resize', resizeMap);
+    return () => {
+      cancelAnimationFrame(resizeFrame);
+      window.clearTimeout(resizeTimer);
+      window.removeEventListener('resize', resizeMap);
+      layersRef.current?.clearLayers();
+      layersRef.current = null;
+      map.remove();
+      if (mapInstanceRef.current === map) mapInstanceRef.current = null;
+    };
+  }, [workspace]);
+
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    const layers = layersRef.current;
+    if (!map || !layers) return undefined;
+    layers.clearLayers();
     const colorFor = bin => bin.priority === 'CRITICAL' ? '#d64545' : bin.priority === 'HIGH' ? '#ef8d32' : bin.priority === 'MEDIUM' ? '#e3b341' : '#238b68';
-    bins.forEach(bin => L.circleMarker([bin.latitude, bin.longitude], { radius: 8, color: '#fff', weight: 2, fillColor: colorFor(bin), fillOpacity: 0.9 }).bindPopup(`<strong>${bin.id}</strong><br>${bin.area || bin.location}, Hyderabad<br>Fill: ${bin.fill}%<br>Status: ${bin.status}`).addTo(map));
-    vehicles.filter(item => item.status !== 'MAINTENANCE').forEach((vehicle, index) => { const bin = bins[index % Math.max(bins.length, 1)]; if (bin) L.circleMarker([bin.latitude + 0.005, bin.longitude + 0.005], { radius: 7, color: '#1f6fb2', fillColor: '#4ca3df', fillOpacity: 1 }).bindPopup(`<strong>${vehicle.id}</strong><br>Hyderabad operating area: ${vehicle.location}<br>Status: ${vehicle.status}<br>Driver: ${vehicle.driver || 'Unassigned'}<br>Load: ${vehicle.currentLoad} / ${vehicle.capacity} kg`).addTo(map); });
-    tasks.filter(task => !['COMPLETED', 'VERIFIED', 'CANCELLED'].includes(task.status)).slice(0, 3).forEach((task, index) => { const points = task.bins.map(id => bins.find(bin => bin.id === id)).filter(Boolean).map(bin => [bin.latitude, bin.longitude]); if (points.length > 1) L.polyline(points, { color: ['#168a77', '#d77659', '#7a6fb2'][index], weight: 4, opacity: 0.8 }).addTo(map).bindPopup(`${task.id} · ${task.status}`); });
-    return () => { map.remove(); };
-  }, [bins, vehicles, tasks]);
+    bins.forEach(bin => L.circleMarker([bin.latitude, bin.longitude], { radius: 8, color: '#fff', weight: 2, fillColor: colorFor(bin), fillOpacity: 0.9 }).bindPopup(`<strong>${bin.id}</strong><br>${bin.area || bin.location}, ${city.name}<br>Fill: ${bin.fill}%<br>Status: ${bin.status}`).addTo(layers));
+    vehicles.filter(item => item.status !== 'MAINTENANCE').forEach((vehicle, index) => { const bin = bins[index % Math.max(bins.length, 1)]; if (bin) L.circleMarker([bin.latitude + 0.005, bin.longitude + 0.005], { radius: 7, color: '#1f6fb2', fillColor: '#4ca3df', fillOpacity: 1 }).bindPopup(`<strong>${vehicle.id}</strong><br>${city.name} operating area: ${vehicle.location}<br>Status: ${vehicle.status}<br>Driver: ${vehicle.driver || 'Unassigned'}<br>Load: ${vehicle.currentLoad} / ${vehicle.capacity} kg`).addTo(layers); });
+    tasks.filter(task => !['COMPLETED', 'VERIFIED', 'CANCELLED'].includes(task.status)).slice(0, 3).forEach((task, index) => { const points = task.bins.map(id => bins.find(bin => bin.id === id)).filter(Boolean).map(bin => [bin.latitude, bin.longitude]); if (points.length > 1) L.polyline(points, { color: ['#168a77', '#d77659', '#7a6fb2'][index], weight: 4, opacity: 0.8 }).addTo(layers).bindPopup(`${task.id} · ${task.status}`); });
+    map.invalidateSize({ pan: false });
+  }, [bins, vehicles, tasks, workspace, city.name]);
+
   const [search, setSearch] = useState('');
-  const mapSearch = event => { event.preventDefault(); const match = bins.find(bin => `${bin.area} ${bin.location}`.toLowerCase().includes(search.toLowerCase())); if (match && mapRef.current?._leaflet_map) mapRef.current._leaflet_map.setView([match.latitude, match.longitude], 14); };
-  return <div className="page"><div className="page-heading"><div><span className="eyebrow">LIVE HYDERABAD OPERATIONS</span><h1>Hyderabad collection map<span className="heading-period">.</span></h1><p>OpenStreetMap view of Hyderabad bins, simulated vehicle positions, and active collection routes.</p></div></div><div className="panel" style={{ padding: 20 }}><form className="incident-form" onSubmit={mapSearch}><label>Search Hyderabad area<input value={search} onChange={event => setSearch(event.target.value)} placeholder="Gachibowli, Madhapur, Uppal" /></label><button className="primary-button" type="submit">Center map</button></form><div ref={node => { mapRef.current = node; }} style={{ height: 520, borderRadius: '18px', overflow: 'hidden' }} /></div></div>;
+  const mapSearch = event => { event.preventDefault(); const match = bins.find(bin => `${bin.area} ${bin.location}`.toLowerCase().includes(search.toLowerCase())); if (match && mapInstanceRef.current) mapInstanceRef.current.setView([match.latitude, match.longitude], 14); };
+  return <div className="page"><div className="page-heading"><div><span className="eyebrow">LIVE {city.name.toUpperCase()} OPERATIONS</span><h1>{city.name} collection map<span className="heading-period">.</span></h1><p>OpenStreetMap view of {city.name} bins, simulated vehicle positions, and active collection routes.</p></div></div><div className="panel" style={{ padding: 20 }}><form className="incident-form" onSubmit={mapSearch}><label>Search {city.name} area<input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search a location" /></label><button className="primary-button" type="submit">Center map</button></form><div ref={mapContainerRef} className="map-container" /></div></div>;
 }
 
 function RoutesView({ admin, operator }) {
@@ -435,11 +698,27 @@ function VehicleAdminControls() {
   return <div className="panel" style={{ marginTop: 20 }}><div className="panel-heading"><div><span className="eyebrow">ADMIN CONTROL</span><h2>Add vehicle</h2></div></div><form className="incident-form" onSubmit={submit}><label>Vehicle ID<input value={form.id} onChange={event => setForm(current => ({ ...current, id: event.target.value }))} placeholder="V-07" required /></label><label>Registration<input value={form.registration} onChange={event => setForm(current => ({ ...current, registration: event.target.value }))} required /></label><label>Capacity (kg)<input type="number" min="1" value={form.capacity} onChange={event => setForm(current => ({ ...current, capacity: event.target.value }))} required /></label><label>Driver<input value={form.driver} onChange={event => setForm(current => ({ ...current, driver: event.target.value }))} required /></label><button className="primary-button" type="submit">Add vehicle</button></form>{message && <div className="task-success">{message}</div>}</div>;
 }
 
+function SimulatorControls() {
+  const [status, setStatus] = useState({ enabled: false, running: false, scenario: 'NORMAL', intervalMs: 5000 });
+  const [message, setMessage] = useState('');
+  const loadStatus = async () => { try { setStatus(await fetchJson('/simulator/status')); setMessage(''); } catch (error) { setMessage(error.message); } };
+  useEffect(() => { loadStatus(); }, []);
+  const control = async (action, selectedScenario = status.scenario) => { try { setStatus(await fetchJson('/simulator/control', { method: 'POST', body: JSON.stringify({ action, scenario: selectedScenario }) })); setMessage(`Scenario set to ${selectedScenario}.`); } catch (error) { setMessage(error.message); } };
+  return <section className="panel monitoring-panel" style={{ marginBottom: 18 }}><div className="panel-heading"><div><span className="eyebrow">SIMULATED ESP32 CONTROL</span><h2>Sensor simulator</h2></div><span className={status.running ? 'live-label' : 'date-filter'}><span />{status.running ? 'RUNNING' : 'STOPPED'}</span></div><div className="incident-form"><label>Demo scenario<select value={status.scenario} onChange={event => control(status.running ? 'start' : undefined, event.target.value)}><option>NORMAL</option><option>HIGH_FILL</option><option>RAPID_FILL</option><option>CRITICAL</option><option>SENSOR_FAILURE</option></select></label><span className="monitoring-health"><span />{status.enabled ? `POST /api/telemetry every ${status.intervalMs}ms` : 'Disabled in backend configuration'}</span><button className="primary-button" type="button" onClick={() => control(status.running ? 'stop' : 'start')}>{status.running ? 'Stop simulator' : 'Start simulator'}</button></div>{message && <div className="task-success">{message}</div>}</section>;
+}
+
+function LiveSensorTable({ bins }) {
+  return <section className="panel monitoring-panel" style={{ marginBottom: 18 }}><div className="panel-heading"><div><span className="eyebrow">TELEMETRY STREAM</span><h2>Live sensor readings</h2></div><span className="live-label"><span />LIVE · SIMULATED</span></div><div style={{ overflowX: 'auto' }}><div className="monitor-table" style={{ minWidth: 920 }}><div className="monitor-head" style={{ gridTemplateColumns: '1fr .8fr .8fr .8fr 1.1fr .8fr 1fr' }}><span>BIN / SENSOR</span><span>FILL</span><span>WEIGHT</span><span>TEMP</span><span>LAST TELEMETRY</span><span>STATUS</span><span>DATA SOURCE</span></div>{bins.map(bin => <div className="monitor-row" style={{ gridTemplateColumns: '1fr .8fr .8fr .8fr 1.1fr .8fr 1fr' }} key={bin.id}><span className="monitor-bin"><strong>{bin.id}<small>{bin.sensorId || 'No sensor ID'}</small></strong></span><span>{bin.fill}%</span><span>{Number(bin.weightKg || 0).toFixed(1)} kg</span><span>{Number(bin.temperature || 0).toFixed(1)} C</span><span>{bin.lastTelemetryAt ? new Date(bin.lastTelemetryAt).toLocaleTimeString() : 'No reading'}</span><span>{bin.sensorStatus || 'UNKNOWN'}</span><span>{bin.dataSource || 'SIMULATED'}</span></div>)}</div></div></section>;
+}
+
 function BinMonitoring({ dashboard, workspace }) {
   const [filter, setFilter] = useState('ALL');
   const bins = dashboard.bins.filter(bin => filter === 'ALL' || bin.priority === filter);
   const counts = dashboard.bins.reduce((result, bin) => { result[bin.priority] = (result[bin.priority] || 0) + 1; return result; }, {});
-  return <div className="page"><div className="page-heading"><div><span className="eyebrow">LIVE SENSOR NETWORK</span><h1>Bin monitoring<span className="heading-period">.</span></h1><p>{dashboard.bins.length} connected bins reporting across {workspace}.</p></div><div className="monitoring-health"><span />SENSORS ONLINE <strong>{dashboard.bins.filter(bin => bin.sensorStatus === 'ONLINE').length}/{dashboard.bins.length}</strong></div></div><div className="monitor-summary">{[['ALL', 'All bins', dashboard.bins.length], ['CRITICAL', 'Critical', counts.CRITICAL || 0], ['HIGH', 'High priority', counts.HIGH || 0], ['MEDIUM', 'Watch list', counts.MEDIUM || 0]].map(([value, label, count]) => <button key={value} className={filter === value ? 'summary-filter selected' : 'summary-filter'} onClick={() => setFilter(value)}><span>{label}</span><strong>{count}</strong></button>)}</div><div className="panel monitoring-panel"><div className="panel-heading"><div><span className="eyebrow">CURRENT CONDITIONS</span><h2>{filter === 'ALL' ? 'All bins' : `${filter.toLowerCase()} priority bins`}</h2></div><span className="live-label"><span />AUTO-REFRESH 30S</span></div><div className="monitor-table"><div className="monitor-head"><span>BIN</span><span>WASTE STREAM</span><span>FILL LEVEL</span><span>FORECAST</span><span>SENSOR</span><span>PRIORITY</span></div>{bins.map(bin => <div className="monitor-row" key={bin.id}><div className="monitor-bin"><div className={`bin-status ${bin.priority.toLowerCase()}`}><Layers3 size={16} /></div><strong>{bin.id}<small>{bin.location}</small></strong></div><span className="waste-label">{bin.wasteType}<small>{bin.capacity}L capacity</small></span><div className="monitor-fill"><div><strong>{bin.fill}%</strong><span>{bin.fillRate}% / hr</span></div><i><b className={bin.priority.toLowerCase()} style={{ width: `${bin.fill}%` }} /></i></div><span className="forecast-cell"><Clock3 size={14} />{bin.forecast.hours}h <small>until overflow</small></span><span className={bin.sensorStatus === 'ONLINE' ? 'sensor-good' : 'sensor-warn'}><span />{bin.sensorStatus}</span><span className={`priority ${bin.priority.toLowerCase()}`}>{bin.priority}</span></div>)}</div>{bins.length === 0 && <div className="empty-state"><Layers3 size={22} /><strong>No bins match this priority</strong><span>Try another monitoring filter.</span></div>}</div></div>;
+  const sensorHealth = dashboard.bins.filter(bin => bin.sensorStatus === 'ONLINE').length;
+  const dataSources = dashboard.bins.reduce((result, bin) => { const source = bin.dataSource || 'SIMULATED'; result[source] = (result[source] || 0) + 1; return result; }, {});
+  const topRiskBins = [...dashboard.bins].sort((a, b) => (b.forecast?.predictedFill3h || b.fill) - (a.forecast?.predictedFill3h || a.fill)).slice(0, 4);
+  return <div className="page"><div className="page-heading"><div><span className="eyebrow">LIVE SENSOR NETWORK</span><h1>Bin monitoring<span className="heading-period">.</span></h1><p>{dashboard.bins.length} connected bins reporting across {workspace}.</p></div><div className="monitoring-health"><span />SENSORS ONLINE <strong>{sensorHealth}/{dashboard.bins.length}</strong></div></div><div className="monitor-summary">{[['ALL', 'All bins', dashboard.bins.length], ['CRITICAL', 'Critical', counts.CRITICAL || 0], ['HIGH', 'High priority', counts.HIGH || 0], ['MEDIUM', 'Watch list', counts.MEDIUM || 0]].map(([value, label, count]) => <button key={value} className={filter === value ? 'summary-filter selected' : 'summary-filter'} onClick={() => setFilter(value)}><span>{label}</span><strong>{count}</strong></button>)}</div><section className="metric-grid">{[['Data sources', Object.entries(dataSources).map(([source, value]) => `${source}: ${value}`).join(' · ') || 'No sources'], ['Sensor health', `${sensorHealth}/${dashboard.bins.length} online`], ['Avg fill', `${Math.round(dashboard.bins.reduce((sum, bin) => sum + bin.fill, 0) / Math.max(dashboard.bins.length, 1))}%`], ['Risk hits', dashboard.metrics.overflowPredictions]].map(([label, value]) => <div className="metric-card" key={label}><span className="metric-label">{label}</span><strong className="metric-value" style={{ fontSize: value.length > 18 ? 18 : 22 }}>{value}</strong></div>)}</section><div className="analytics-grid"><div className="panel analytics-chart"><div className="panel-heading"><div><span className="eyebrow">LIVE SENSOR PANEL</span><h2>Telemetry health</h2></div></div><div className="task-table">{topRiskBins.map(bin => <div className="task-row full-task-row" key={bin.id}><strong>{bin.id}<small>{bin.location}</small></strong><span className={`priority ${bin.priority.toLowerCase()}`}>{bin.priority}</span><span className="route-cell"><Radio size={14} />{bin.dataSource || 'SIMULATED'}<small>{bin.sensorId || 'No sensor id'} · {bin.sensorStatus || 'OFFLINE'}</small></span><span className="forecast-cell"><Clock3 size={14} />{bin.forecast?.hours || 'N/A'}h <small>forecast</small></span></div>)}</div></div><div className="panel impact-panel"><div className="panel-heading"><div><span className="eyebrow">PREDICTION PANEL</span><h2>Overflow watch</h2></div></div>{topRiskBins.map(bin => <div className="impact-row" key={`${bin.id}-prediction`}><strong>{bin.id}</strong><span>{bin.forecast?.overflowRisk || bin.priority}<br /><small>{bin.forecast?.factors?.[0] || `${bin.fill}% current fill`}</small></span></div>)}{!topRiskBins.length && <div className="empty-popover">No bins are currently predicted to overflow.</div>}</div></div><div className="panel monitoring-panel"><div className="panel-heading"><div><span className="eyebrow">CURRENT CONDITIONS</span><h2>{filter === 'ALL' ? 'All bins' : `${filter.toLowerCase()} priority bins`}</h2></div><span className="live-label"><span />AUTO-REFRESH 30S</span></div><div className="monitor-table"><div className="monitor-head"><span>BIN</span><span>WASTE STREAM</span><span>FILL LEVEL</span><span>FORECAST</span><span>SENSOR</span><span>PRIORITY</span></div>{bins.map(bin => <div className="monitor-row" key={bin.id}><div className="monitor-bin"><div className={`bin-status ${bin.priority.toLowerCase()}`}><Layers3 size={16} /></div><strong>{bin.id}<small>{bin.location}</small></strong></div><span className="waste-label">{bin.wasteType}<small>{bin.capacity}L capacity</small></span><div className="monitor-fill"><div><strong>{bin.fill}%</strong><span>{bin.fillRate}% / hr</span></div><i><b className={bin.priority.toLowerCase()} style={{ width: `${bin.fill}%` }} /></i></div><span className="forecast-cell"><Clock3 size={14} />{bin.forecast.hours}h <small>until overflow</small></span><span className={bin.sensorStatus === 'ONLINE' ? 'sensor-good' : 'sensor-warn'}><span />{bin.sensorStatus}</span><span className={`priority ${bin.priority.toLowerCase()}`}>{bin.priority}</span></div>)}</div>{bins.length === 0 && <div className="empty-state"><Layers3 size={22} /><strong>No bins match this priority</strong><span>Try another monitoring filter.</span></div>}</div></div>;
 }
 
 function CollectionTasks({ tasks, operator, admin, sessionUser, updateTask, createTask }) {
@@ -455,7 +734,8 @@ function CollectionTasks({ tasks, operator, admin, sessionUser, updateTask, crea
   const save = async event => { event.preventDefault(); const result = await createTask({ bins: form.bins.split(',').map(value => value.trim()).filter(Boolean), vehicleId: form.vehicleId, assigneeId: admin ? form.assigneeId || null : sessionUser?.id, priority: form.priority, reason: form.reason || 'Manual collection task created' }); if (result) { setForm({ bins: '', vehicleId: '', assigneeId: '', priority: 'HIGH', reason: '' }); setMessage('Task created and added to the live queue.'); } };
   const assign = async (task, assigneeId, vehicleId) => { try { if (assigneeId) await fetchJson(`/collections/${task.id}/assign`, { method: 'PATCH', body: JSON.stringify({ assigneeId }) }); if (vehicleId) await fetchJson(`/collections/${task.id}/details`, { method: 'PATCH', body: JSON.stringify({ vehicleId }) }); setMessage(`${task.id} assignment saved.`); setSelected(null); } catch (error) { setMessage(error.message); } };
   const nextStatus = status => ({ CREATED: 'DISPATCHED', DISPATCHED: 'DRIVER_EN_ROUTE', DRIVER_EN_ROUTE: 'ARRIVED', ARRIVED: 'COLLECTING', COLLECTING: 'COMPLETED', COMPLETED: 'VERIFIED', PENDING: 'ASSIGNED', ASSIGNED: 'EN_ROUTE', EN_ROUTE: 'COLLECTING', IN_PROGRESS: 'COLLECTING' }[status] || 'COMPLETED');
-  return <div className="page"><div className="page-heading"><div><span className="eyebrow">FIELD OPERATIONS</span><h1>Manage tasks<span className="heading-period">.</span></h1><p>Search, filter, assign, and update the shared Hyderabad collection queue.</p></div></div>{(admin || operator) && <form className="panel incident-form" onSubmit={save}><div className="panel-heading"><div><span className="eyebrow">{admin ? 'DISPATCH ACTION' : 'FIELD ACTION'}</span><h2>Create collection task</h2></div></div><label>Bin IDs<input value={form.bins} onChange={event => setForm(current => ({ ...current, bins: event.target.value }))} placeholder="HYG-001, HYG-002" required /></label><label>Vehicle<select value={form.vehicleId} onChange={event => setForm(current => ({ ...current, vehicleId: event.target.value }))} required><option value="">Select vehicle</option>{vehicles.map(vehicle => <option key={vehicle.id} value={vehicle.id}>{vehicle.id} · {vehicle.driver}</option>)}</select></label><label>Priority<select value={form.priority} onChange={event => setForm(current => ({ ...current, priority: event.target.value }))}><option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option></select></label>{admin && <label>Operator<select value={form.assigneeId} onChange={event => setForm(current => ({ ...current, assigneeId: event.target.value }))}><option value="">Unassigned</option>{operators.map(user => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label>}<label>Reason<input value={form.reason} onChange={event => setForm(current => ({ ...current, reason: event.target.value }))} placeholder="Why is this collection needed?" /></label><button className="primary-button" type="submit">Create task</button></form>}{message && <div className="task-success">{message}</div>}<div className="panel tasks-panel full-tasks-panel"><div className="panel-heading"><div><span className="eyebrow">DISPATCH BOARD</span><h2>{visible.length} tasks</h2></div><div className="task-filters"><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Search tasks" aria-label="Search tasks" /><select value={statusFilter} onChange={event => setStatusFilter(event.target.value)}><option>ALL</option><option>PENDING</option><option>ASSIGNED</option><option>EN_ROUTE</option><option>COLLECTING</option><option>IN_PROGRESS</option><option>COMPLETED</option><option>CANCELLED</option></select></div></div><div className="task-table"><div className="task-head"><span>TASK</span><span>PRIORITY</span><span>LOCATION</span><span>ASSIGNMENT</span><span>STATUS</span></div>{visible.length ? visible.map(task => <button className="task-row full-task-row" key={task.id} onClick={() => setSelected(task)}><strong>{task.id}<small>{task.source === 'AI' ? 'AI generated' : 'Manual'} · {task.reason}</small></strong><span className={`priority ${task.priority.toLowerCase()}`}>{task.priority}</span><span className="route-cell"><Route size={14} />{task.bins.join(' → ')}<small>{task.distance} km · {task.duration} min</small></span><span className="assignment-cell"><Truck size={14} /><span>{task.vehicle}<small>{task.driver || 'Unassigned'}</small></span></span><span className={`task-status ${task.status.toLowerCase()}`}><span />{task.status.replace('_', ' ')}</span></button>) : <div className="empty-popover">No tasks match the current filters.</div>}</div></div>{selected && <div className="detail-drawer"><button className="icon-button" onClick={() => setSelected(null)} aria-label="Close task details"><X size={16} /></button><span className="eyebrow">TASK DETAIL</span><h2>{selected.id}</h2><p>{selected.reason}<br />Status {selected.status}<br />Priority {selected.priority}<br />Vehicle {selected.vehicle}<br />Driver {selected.driver || 'Unassigned'}</p>{admin && <><label>Assign operator<select defaultValue={selected.assigneeId || ''} onChange={event => assign(selected, event.target.value, '')}><option value="">Unassigned</option>{operators.map(user => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label><label>Assign vehicle<select defaultValue={selected.vehicle || ''} onChange={event => assign(selected, '', event.target.value)}><option value="">Select vehicle</option>{vehicles.map(vehicle => <option key={vehicle.id} value={vehicle.id}>{vehicle.id}</option>)}</select></label></>}{!['COMPLETED', 'CANCELLED'].includes(selected.status) && <button className="secondary-button" onClick={() => { updateTask(selected.id, nextStatus(selected.status)); setSelected(null); }}>Advance status</button>}</div>}</div>;
+  const startResponse = async task => { try { await fetchJson(`/collections/${task.id}/demo-start`, { method: 'POST', body: JSON.stringify({ delayMs: 1500 }) }); setMessage(`${task.id} response started through the backend lifecycle.`); } catch (error) { setMessage(error.message); } };
+  return <div className="page"><div className="page-heading"><div><span className="eyebrow">FIELD OPERATIONS</span><h1>Manage tasks<span className="heading-period">.</span></h1><p>Search, filter, assign, and update the shared Hyderabad collection queue.</p></div></div>{(admin || operator) && <form className="panel incident-form" onSubmit={save}><div className="panel-heading"><div><span className="eyebrow">{admin ? 'DISPATCH ACTION' : 'FIELD ACTION'}</span><h2>Create collection task</h2></div></div><label>Bin IDs<input value={form.bins} onChange={event => setForm(current => ({ ...current, bins: event.target.value }))} placeholder="HYG-001, HYG-002" required /></label><label>Vehicle<select value={form.vehicleId} onChange={event => setForm(current => ({ ...current, vehicleId: event.target.value }))} required><option value="">Select vehicle</option>{vehicles.map(vehicle => <option key={vehicle.id} value={vehicle.id}>{vehicle.id} · {vehicle.driver}</option>)}</select></label><label>Priority<select value={form.priority} onChange={event => setForm(current => ({ ...current, priority: event.target.value }))}><option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option></select></label>{admin && <label>Operator<select value={form.assigneeId} onChange={event => setForm(current => ({ ...current, assigneeId: event.target.value }))}><option value="">Unassigned</option>{operators.map(user => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label>}<label>Reason<input value={form.reason} onChange={event => setForm(current => ({ ...current, reason: event.target.value }))} placeholder="Why is this collection needed?" /></label><button className="primary-button" type="submit">Create task</button></form>}{message && <div className="task-success">{message}</div>}<div className="panel tasks-panel full-tasks-panel"><div className="panel-heading"><div><span className="eyebrow">DISPATCH BOARD</span><h2>{visible.length} tasks</h2></div><div className="task-filters"><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Search tasks" aria-label="Search tasks" /><select value={statusFilter} onChange={event => setStatusFilter(event.target.value)}><option>ALL</option><option>PENDING</option><option>ASSIGNED</option><option>EN_ROUTE</option><option>COLLECTING</option><option>IN_PROGRESS</option><option>COMPLETED</option><option>CANCELLED</option></select></div></div><div className="task-table"><div className="task-head"><span>TASK</span><span>PRIORITY</span><span>LOCATION</span><span>ASSIGNMENT</span><span>STATUS</span></div>{visible.length ? visible.map(task => <button className="task-row full-task-row" key={task.id} onClick={() => setSelected(task)}><strong>{task.id}<small>{task.source === 'AI' ? 'AI generated' : 'Manual'} · {task.reason}</small></strong><span className={`priority ${task.priority.toLowerCase()}`}>{task.priority}</span><span className="route-cell"><Route size={14} />{task.bins.join(' → ')}<small>{task.distance} km · {task.duration} min</small></span><span className="assignment-cell"><Truck size={14} /><span>{task.vehicle}<small>{task.driver || 'Unassigned'}</small></span></span><span className={`task-status ${task.status.toLowerCase()}`}><span />{task.status.replace('_', ' ')}</span></button>) : <div className="empty-popover">No tasks match the current filters.</div>}</div></div>{selected && <div className="detail-drawer"><button className="icon-button" onClick={() => setSelected(null)} aria-label="Close task details"><X size={16} /></button><span className="eyebrow">TASK DETAIL</span><h2>{selected.id}</h2><p>{selected.reason}<br />Status {selected.status}<br />Priority {selected.priority}<br />Vehicle {selected.vehicle}<br />Driver {selected.driver || 'Unassigned'}{selected.reportId ? <><br />Report {selected.reportId}<br />Data source SIMULATED / PUBLIC REPORT</> : null}</p>{(selected.reportId && ['CREATED', 'DISPATCHED'].includes(selected.status) || selected.source === 'PUBLIC_REPORT_AGENT') && !['VERIFIED', 'CANCELLED'].includes(selected.status) && <button className="primary-button" onClick={() => { startResponse(selected); setSelected(null); }}>Start response</button>}{admin && <><label>Assign operator<select defaultValue={selected.assigneeId || ''} onChange={event => assign(selected, event.target.value, '')}><option value="">Unassigned</option>{operators.map(user => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label><label>Assign vehicle<select defaultValue={selected.vehicle || ''} onChange={event => assign(selected, '', event.target.value)}><option value="">Select vehicle</option>{vehicles.map(vehicle => <option key={vehicle.id} value={vehicle.id}>{vehicle.id}</option>)}</select></label></>}{!['COMPLETED', 'CANCELLED'].includes(selected.status) && !selected.reportId && <button className="secondary-button" onClick={() => { updateTask(selected.id, nextStatus(selected.status)); setSelected(null); }}>Advance status</button>}</div>}</div>;
 }
 
 function LegacyCollectionTasks({ tasks, operator, updateTask }) {
@@ -492,6 +772,12 @@ function AgentsView() {
   const [error, setError] = useState('');
   useEffect(() => { Promise.all([fetchJson('/agents'), fetchJson('/agents/memory')]).then(([current, memory]) => { setAgents(current); setActivity(memory.timeline || memory.audit || []); }).catch(err => setError(err.message)); }, []);
   return <div className="page"><div className="page-heading"><div><span className="eyebrow">ECOFLOW AI ORCHESTRATOR</span><h1>Agent status<span className="heading-period">.</span></h1><p>One backend-validated orchestrator: prediction, prioritization, fleet and driver assignment, routing, dispatch, monitoring, verification, and re-planning.</p></div><span className="role-badge operator">VALIDATED TOOLS</span></div>{error && <div className="error-banner"><AlertTriangle size={17} />{error}</div>}<div className="panel tasks-panel"><div className="panel-heading"><div><span className="eyebrow">ACTIVITY FEED</span><h2>Recent orchestrator actions</h2></div></div>{activity.length ? activity.map(item => <div className="task-row full-task-row" key={item.id}><strong>{item.action}<small>{item.user || 'EcoFlow Orchestrator'}</small></strong><span>{item.resource}</span><span>{item.resourceId}</span><span>{new Date(item.timestamp).toLocaleString()}</span></div>) : <div className="empty-popover">No agent activity recorded yet.</div>}</div></div>;
+}
+
+function AgentActivityPanel() {
+  const [activity, setActivity] = useState([]);
+  useEffect(() => { const load = () => fetchJson('/agents/memory').then(memory => setActivity(memory.timeline || [])).catch(() => {}); load(); const timer = setInterval(load, 5000); return () => clearInterval(timer); }, []);
+  return <section className="panel tasks-panel" style={{ marginTop: 18 }}><div className="panel-heading"><div><span className="eyebrow">AI AGENT ACTIVITY</span><h2>Public report response trail</h2></div><span className="live-label"><span />LIVE</span></div>{activity.length ? activity.slice(0, 12).map(item => <div className="task-row full-task-row" key={item.id}><strong>{item.action}<small>{item.phase}</small></strong><span>{item.rationale}</span><span>{item.result?.reportId || item.result?.taskId || 'SYSTEM'}</span><span>{new Date(item.timestamp).toLocaleTimeString()}</span></div>) : <div className="empty-popover">No agent activity recorded yet.</div>}</section>;
 }
 
 function DynamicAnalyticsView({ dashboard }) {

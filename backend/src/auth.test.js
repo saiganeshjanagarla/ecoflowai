@@ -26,7 +26,9 @@ test('permission registry separates admin, operator, and viewer capabilities', (
   assert.equal(PERMISSIONS[ROLES.OPERATOR].has('users.create'), false);
   assert.equal(PERMISSIONS[ROLES.OPERATOR].has('tasks.updateOwn'), true);
   assert.equal(PERMISSIONS[ROLES.VIEWER].has('tasks.updateOwn'), false);
-  assert.equal(PERMISSIONS[ROLES.VIEWER].has('analytics.read'), true);
+  assert.equal(PERMISSIONS[ROLES.VIEWER].has('analytics.read'), false);
+  assert.equal(PERMISSIONS[ROLES.VIEWER].has('reports.create'), true);
+  assert.equal(PERMISSIONS[ROLES.VIEWER].has('reports.read'), false);
 });
 
 test('issued session token carries the authenticated role', () => {

@@ -4,7 +4,8 @@ const cors = require('cors');
 const { z } = require('zod');
 const store = require('./store');
 const agent = require('./agent');
-const { authenticateUser, getProfile, updateProfile, issueToken, requireAuth, requireRole, requirePermission, listUsers, createUser, updateUser, deleteUser, findUser, ROLES } = require('./auth');
+const sensorSimulator = require('./sensorSimulator');
+const { authenticateUser, getProfile, updateProfile, issueToken, requireAuth, requireRole, requirePermission, listUsers, createUser, updateUser, deleteUser, findUser, ROLES, SUPPORTED_WORKSPACES } = require('./auth');
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -17,19 +18,35 @@ const automation = {
   lastError: null
 };
 const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173').split(',').map(origin => origin.trim());
+const workspaceFor = (user, queryWorkspace) => user?.workspace || queryWorkspace || 'Hyderabad Operations';
+const scoped = (records, workspace) => records.filter(record => (record.workspace || 'Hyderabad Operations') === workspace);
+const ownedResource = (user, record) => record && (record.workspace || 'Hyderabad Operations') === workspaceFor(user);
+const loginAttempts = new Map();
+const loginRateLimit = (req, res, next) => {
+  const key = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const entry = loginAttempts.get(key) || { count: 0, resetAt: now + 15 * 60 * 1000 };
+  if (now > entry.resetAt) { entry.count = 0; entry.resetAt = now + 15 * 60 * 1000; }
+  if (entry.count >= 5) return res.status(429).json({ error: 'Too many login attempts. Try again later.' });
+  entry.count += 1;
+  loginAttempts.set(key, entry);
+  return next();
+};
 app.use(cors({ origin: (origin, callback) => {
   if (!origin || allowedOrigins.includes(origin) || /^http:\/\/(localhost|127\.0\.0\.1):5173$/.test(origin)) return callback(null, true);
   return callback(new Error('Origin not allowed by CORS'));
 } }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const getDashboardState = (workspaceName = 'Hyderabad Operations', user = null) => {
   const visibleTasks = user?.role === 'OPERATOR' ? store.tasks.filter(task => task.assigneeId === user.sub) : store.tasks;
   const bins = agent.getWorkspaceBins(workspaceName).map(bin => {
     const forecast = agent.predictedOverflow(bin);
     const priority = agent.priorityFor(bin, forecast);
+    const telemetryAgeMinutes = bin.lastTelemetryAt ? (Date.now() - Date.parse(bin.lastTelemetryAt)) / 60000 : Infinity;
     return {
       ...bin,
+      sensorStatus: telemetryAgeMinutes > 5 ? 'STALE' : bin.sensorStatus,
       forecast,
       priority,
       predictedOverflowTime: forecast.at,
@@ -47,15 +64,16 @@ const getDashboardState = (workspaceName = 'Hyderabad Operations', user = null) 
   const routeEfficiency = Math.max(70, Math.min(97, Math.round(100 - (routeDistance / Math.max(totalWasteGenerated / 16, 1)))));
   const recyclingRate = Math.max(35, Math.min(95, Math.round((bins.filter(bin => ['Organic', 'Paper', 'Glass'].includes(bin.wasteType)).reduce((sum, bin) => sum + bin.fill, 0) / Math.max(bins.length, 1)))));
   return {
+    city: store.cityConfigs[workspaceName] || store.cityConfigs['Hyderabad Operations'],
     metrics: {
       totalBins: bins.length,
       criticalBins: critical,
       overflowRisk: critical + high,
       todaysWaste: Math.round(totalWasteGenerated),
       activeTasks,
-      availableVehicles: store.vehicles.filter(vehicle => vehicle.status === 'AVAILABLE').length,
-      assignedRoutes: store.routes.filter(route => !['COMPLETED', 'CANCELLED'].includes(route.status)).length,
-      criticalAlerts: store.incidents.filter(item => item.severity === 'CRITICAL' && item.status !== 'RESOLVED').length,
+      availableVehicles: scoped(store.vehicles, workspaceName).filter(vehicle => vehicle.status === 'AVAILABLE').length,
+      assignedRoutes: scoped(store.routes, workspaceName).filter(route => !['COMPLETED', 'CANCELLED'].includes(route.status)).length,
+      criticalAlerts: scoped(store.incidents, workspaceName).filter(item => item.severity === 'CRITICAL' && item.status !== 'RESOLVED').length,
       onlineAgents: store.agents.filter(item => ['ONLINE', 'BUSY'].includes(item.status)).length,
       overflowPredictions: bins.filter(bin => ['CRITICAL', 'HIGH'].includes(bin.priority)).length,
       estimatedSavings: Math.round(totalWasteCollected * 0.56 * 18 + routeDistance * 24),
@@ -65,11 +83,11 @@ const getDashboardState = (workspaceName = 'Hyderabad Operations', user = null) 
       diversionPercentage: diversion,
       recyclingRate,
       routeEfficiency,
-      overflowIncidents: store.incidents.filter(item => item.status !== 'RESOLVED').length,
+      overflowIncidents: scoped(store.incidents, workspaceName).filter(item => item.status !== 'RESOLVED').length,
       completedCollections: completedTasks.length,
       taskCompletionRate: visibleTasks.length ? Math.round((completedTasks.length / visibleTasks.length) * 100) : 0,
-      vehicleUtilization: store.vehicles.length ? Math.round((store.vehicles.filter(v => ['ASSIGNED', 'EN_ROUTE', 'COLLECTING'].includes(v.status)).length / store.vehicles.length) * 100) : 0,
-      driverUtilization: store.drivers.length ? Math.round((store.drivers.filter(d => d.status === 'ON_ROUTE').length / store.drivers.length) * 100) : 0,
+      vehicleUtilization: scoped(store.vehicles, workspaceName).length ? Math.round((scoped(store.vehicles, workspaceName).filter(v => ['ASSIGNED', 'EN_ROUTE', 'COLLECTING'].includes(v.status)).length / scoped(store.vehicles, workspaceName).length) * 100) : 0,
+      driverUtilization: scoped(store.drivers, workspaceName).length ? Math.round((scoped(store.drivers, workspaceName).filter(d => d.status === 'ON_ROUTE').length / scoped(store.drivers, workspaceName).length) * 100) : 0,
       routeDistance,
       estimatedFuel: Number((routeDistance * 0.16).toFixed(1))
     },
@@ -80,13 +98,126 @@ const getDashboardState = (workspaceName = 'Hyderabad Operations', user = null) 
       else result.push({ name: bin.wasteType, value: Math.max(5, Math.round((bin.fill / 100) * 100)) });
       return result;
     }, []).slice(0, 5),
-    incidents: store.incidents.slice(0, 4),
+    incidents: scoped(store.incidents, workspaceName).slice(0, 4),
     bins
   };
 };
 
 app.get('/api/health', (_, res) => res.json({ status: 'ok', service: 'ecoflow-api' }));
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/telemetry', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
+  const schema = z.object({
+    binId: z.string().regex(/^(HYG|WYG)-\d{3,}$/),
+    fillLevel: z.number().min(0).max(100),
+    weightKg: z.number().min(0).optional(),
+    temperature: z.number().optional(),
+    humidity: z.number().min(0).max(100).optional(),
+    timestamp: z.string().datetime().optional(),
+    source: z.string().optional(),
+    sensorId: z.string().optional()
+  });
+  const parsed = schema.safeParse(req.body || {});
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid telemetry payload', details: parsed.error.flatten() });
+  try {
+    const result = agent.handleTelemetry(parsed.data, req.user);
+    res.status(201).json({ success: true, data: result, message: 'Telemetry accepted', ...result });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+app.get('/api/simulator/status', requireAuth, requireRole('ADMIN'), (_, res) => res.json({ enabled: process.env.SENSOR_SIMULATOR_ENABLED === 'true', running: sensorSimulator.isRunning(), mode: sensorSimulator.getScenario(), scenario: sensorSimulator.getScenario(), binId: sensorSimulator.selectedBinId(), intervalMs: Math.max(1000, Number(process.env.SENSOR_SIMULATOR_INTERVAL_MS) || 5000) }));
+app.post('/api/simulator/control', requireAuth, requireRole('ADMIN'), (req, res) => {
+  try {
+    if (req.body?.scenario) sensorSimulator.setScenario(req.body.scenario);
+    if (req.body?.action === 'start') sensorSimulator.startSensorSimulator();
+    if (req.body?.action === 'stop') sensorSimulator.stopSensorSimulator();
+    res.json({ success: true, running: sensorSimulator.isRunning(), scenario: sensorSimulator.getScenario() });
+  } catch (error) { res.status(400).json({ error: error.message }); }
+});
+app.get('/api/telemetry/:binId', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
+  const bin = store.bins.find(item => item.id === req.params.binId && item.workspace === workspaceFor(req.user, req.query.workspace));
+  if (!bin) return res.status(404).json({ error: 'Bin not found in selected workspace' });
+  const entries = store.telemetry.filter(reading => reading.binId === req.params.binId).slice(0, 20);
+  res.json({ success: true, data: entries, latest: entries[0] || null, binId: req.params.binId });
+});
+app.post('/api/public-reports', (req, res, next) => {
+  if (!req.headers.authorization) return next();
+  return requireAuth(req, res, next);
+}, (req, res, next) => {
+  if (!req.user || [ROLES.ADMIN, ROLES.OPERATOR, ROLES.VIEWER, ROLES.CITIZEN].includes(req.user.role)) return next();
+  return res.status(403).json({ error: 'Report submission is not available for this role' });
+}, (req, res) => {
+  const schema = z.object({
+    issueType: z.string().min(1),
+    photo: z.string().min(1),
+    latitude: z.number(),
+    longitude: z.number(),
+    description: z.string().optional(),
+    timestamp: z.string().datetime().optional(),
+    status: z.string().optional(),
+    binId: z.string().optional(),
+    source: z.string().optional(),
+  });
+  const parsed = schema.safeParse(req.body || {});
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid public report payload', details: parsed.error.flatten() });
+  try {
+    const user = req.user || { role: 'PUBLIC' };
+    const report = agent.submitPublicReport(parsed.data, user);
+    res.status(201).json({ success: true, data: report, message: 'Report submitted', ...report });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+app.get('/api/public-reports/:id/status', requireAuth, (req, res) => {
+  const report = store.publicReports.find(item => item.id === req.params.id);
+  if (!report) return res.status(404).json({ error: 'Public report not found' });
+  if (!ownedResource(req.user, report)) return res.status(404).json({ error: 'Public report not found in your workspace' });
+  const personalRole = [ROLES.VIEWER, ROLES.CITIZEN].includes(req.user.role);
+  if (personalRole && report.reporterId !== req.user.sub) return res.status(403).json({ error: 'You cannot access another user\'s report.' });
+  const notification = store.notifications.find(item => item.type === 'PUBLIC_REPORT_RESOLVED' && item.reportId === report.id) || null;
+  const timeline = store.agentTimeline.filter(item => item.result?.reportId === report.id).slice().reverse();
+  const data = { id: report.id, status: report.status, currentAction: report.currentAction, resolvedAt: report.resolvedAt, issueType: report.issueType, latitude: report.latitude, longitude: report.longitude, severity: report.severity, confidence: report.confidence, aiAnalysis: report.aiAnalysis, description: report.description, photo: report.photo, createdAt: report.createdAt, resolutionDetails: report.resolutionDetails, timeline, notification };
+  if (!personalRole) Object.assign(data, { taskId: report.taskId, linkedBinId: report.linkedBinId, assignedVehicleId: report.assignedVehicleId, assignedDriverId: report.assignedDriverId });
+  res.json({ success: true, data });
+});
+app.get('/api/public-reports', requireAuth, (req, res) => {
+  const mine = req.query.mine === 'true';
+  const isOwnReport = report => report.reporterId === req.user.sub;
+  if ([ROLES.CITIZEN, ROLES.VIEWER].includes(req.user.role) && !mine) return res.status(403).json({ error: 'Use the personal reports view.' });
+  const requestedWorkspace = workspaceFor(req.user, req.query.workspace);
+  const reportsInCity = store.publicReports.filter(report => !report.workspace || report.workspace === requestedWorkspace);
+  const reports = mine || [ROLES.CITIZEN, ROLES.VIEWER].includes(req.user.role)
+    ? reportsInCity.filter(isOwnReport)
+    : reportsInCity;
+  const data = [ROLES.CITIZEN, ROLES.VIEWER].includes(req.user.role)
+    ? reports.map(report => ({ id: report.id, issueType: report.issueType, photo: report.photo, description: report.description, latitude: report.latitude, longitude: report.longitude, timestamp: report.timestamp, createdAt: report.createdAt, status: report.status, severity: report.severity, confidence: report.confidence, currentAction: report.currentAction, resolvedAt: report.resolvedAt, resolutionDetails: report.resolutionDetails }))
+    : reports;
+  res.json({ success: true, data, total: data.length, count: data.length });
+});
+app.get('/api/public-reports/:id', requireAuth, (req, res) => {
+  const report = store.publicReports.find(item => item.id === req.params.id);
+  if (!report) return res.status(404).json({ error: 'Public report not found' });
+  if (!ownedResource(req.user, report)) return res.status(404).json({ error: 'Public report not found in your workspace' });
+  const personalRole = [ROLES.VIEWER, ROLES.CITIZEN].includes(req.user.role);
+  if (personalRole && report.reporterId !== req.user.sub) return res.status(403).json({ error: 'You cannot access another user\'s report.' });
+  const data = personalRole ? { id: report.id, issueType: report.issueType, photo: report.photo, description: report.description, latitude: report.latitude, longitude: report.longitude, timestamp: report.timestamp, createdAt: report.createdAt, status: report.status, severity: report.severity, confidence: report.confidence, currentAction: report.currentAction, resolvedAt: report.resolvedAt, resolutionDetails: report.resolutionDetails } : report;
+  res.json({ success: true, data, ...data });
+});
+app.get('/api/bins/:id/prediction', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
+  if (!store.bins.some(bin => bin.id === req.params.id && ownedResource(req.user, bin))) return res.status(404).json({ error: 'Bin not found' });
+  try {
+    const prediction = agent.predictBinFill(req.params.id, new Date());
+    res.json({ success: true, data: prediction, ...prediction });
+  } catch (error) {
+    return res.status(404).json({ error: error.message });
+  }
+});
+app.get('/api/bins/:id/history', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
+  if (!store.bins.some(bin => bin.id === req.params.id && ownedResource(req.user, bin))) return res.status(404).json({ error: 'Bin not found' });
+  const history = (store.history || []).filter(item => item.binId === req.params.id).slice(0, 20);
+  const tasks = store.collectionHistory.filter(item => item.bins?.includes(req.params.id)).slice(0, 20);
+  res.json({ success: true, data: { history, tasks }, binId: req.params.id });
+});
+app.post('/api/auth/login', loginRateLimit, (req, res) => {
   const user = authenticateUser(req.body?.email, req.body?.password);
   if (!user) return res.status(401).json({ error: 'Invalid email or password' });
   store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: user.email, role: user.role, action: 'User login', resource: 'user', resourceId: user.id, timestamp: new Date().toISOString(), metadata: {} });
@@ -95,7 +226,7 @@ app.post('/api/auth/login', (req, res) => {
 app.get('/api/auth/me', requireAuth, (req, res) => res.json({ user: getProfile(req.user) }));
 app.patch('/api/auth/profile', requireAuth, (req, res) => {
   const schema = z.object({
-    workspace: z.string().min(1).optional(),
+    workspace: z.enum(SUPPORTED_WORKSPACES).optional(),
     notifications: z.boolean().optional(),
     autoRefresh: z.boolean().optional()
   });
@@ -137,20 +268,21 @@ app.delete('/api/users/:id', requireAuth, requirePermission('users.delete'), (re
   store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: 'Deleted user', resource: 'user', resourceId: req.params.id, timestamp: new Date().toISOString(), metadata: {} });
   res.json({ success: true, id: req.params.id });
 });
-app.get('/api/dashboard', requireAuth, (req, res) => res.json(getDashboardState(req.user.workspace || req.query.workspace || 'Hyderabad Operations', req.user)));
-app.get('/api/map', requireAuth, (req, res) => {
-  const workspaceName = req.user.workspace || req.query.workspace || 'Hyderabad Operations';
+app.get('/api/dashboard', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => res.json(getDashboardState(workspaceFor(req.user, req.query.workspace), req.user)));
+app.get('/api/map', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
+  const workspaceName = workspaceFor(req.user, req.query.workspace);
+  const city = store.cityConfigs[workspaceName] || store.cityConfigs['Hyderabad Operations'];
   const payload = {
     bins: agent.getWorkspaceBins(workspaceName),
-    vehicles: store.vehicles,
-    tasks: store.tasks,
-    routes: store.routes,
-    alerts: store.incidents,
-    center: { latitude: 17.3850, longitude: 78.4867 }
+    vehicles: scoped(store.vehicles, workspaceName),
+    tasks: scoped(store.tasks, workspaceName),
+    routes: scoped(store.routes, workspaceName),
+    alerts: scoped(store.incidents, workspaceName),
+    center: { latitude: city.latitude, longitude: city.longitude }
   };
   res.json({ success: true, message: 'Hyderabad map data loaded', data: payload, ...payload });
 });
-app.get('/api/bins', requireAuth, requirePermission('bins.read'), (req, res) => res.json(agent.getWorkspaceBins(req.user.workspace || req.query.workspace || 'Hyderabad Operations')));
+app.get('/api/bins', requireAuth, requirePermission('bins.read'), (req, res) => res.json(agent.getWorkspaceBins(workspaceFor(req.user, req.query.workspace))));
 app.post('/api/bins', requireAuth, requirePermission('bins.create'), (req, res) => {
   const schema = z.object({ id: z.string().regex(/^(HYG|B)-\d{3,}$/), location: z.string().min(1), wasteType: z.string().min(1), capacity: z.number().positive(), latitude: z.number(), longitude: z.number() });
   const parsed = schema.safeParse(req.body || {});
@@ -165,7 +297,7 @@ app.patch('/api/bins/:id', requireAuth, requirePermission('bins.update'), (req, 
   const schema = z.object({ fill: z.number().min(0).max(100).optional(), status: z.string().optional(), location: z.string().min(1).optional(), wasteType: z.string().min(1).optional() });
   const parsed = schema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: 'Invalid bin update', details: parsed.error.flatten() });
-  const bin = store.bins.find(item => item.id === req.params.id);
+  const bin = store.bins.find(item => item.id === req.params.id && ownedResource(req.user, item));
   if (!bin) return res.status(404).json({ error: 'Bin not found' });
   Object.assign(bin, parsed.data);
   bin.priority = agent.priorityFor(bin, agent.predictedOverflow(bin));
@@ -174,19 +306,19 @@ app.patch('/api/bins/:id', requireAuth, requirePermission('bins.update'), (req, 
   res.json(bin);
 });
 app.delete('/api/bins/:id', requireAuth, requirePermission('bins.delete'), (req, res) => {
-  const index = store.bins.findIndex(item => item.id === req.params.id);
+  const index = store.bins.findIndex(item => item.id === req.params.id && ownedResource(req.user, item));
   if (index < 0) return res.status(404).json({ error: 'Bin not found' });
   const [bin] = store.bins.splice(index, 1);
   store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: 'Deleted bin', resource: 'bin', resourceId: bin.id, timestamp: new Date().toISOString(), metadata: {} });
   res.json({ success: true, id: bin.id });
 });
-app.get('/api/vehicles', requireAuth, requirePermission('vehicles.read'), (_, res) => res.json(store.vehicles));
+app.get('/api/vehicles', requireAuth, requirePermission('vehicles.read'), (req, res) => res.json(scoped(store.vehicles, workspaceFor(req.user, req.query.workspace))));
 app.post('/api/vehicles', requireAuth, requirePermission('vehicles.create'), (req, res) => {
   const schema = z.object({ id: z.string().regex(/^V-\d{2,}$/), registration: z.string().min(1), capacity: z.number().positive(), driver: z.string().min(1) });
   const parsed = schema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: 'Invalid vehicle payload', details: parsed.error.flatten() });
   if (store.vehicles.some(vehicle => vehicle.id === parsed.data.id)) return res.status(400).json({ error: 'Vehicle ID already exists' });
-  const vehicle = { ...parsed.data, currentLoad: 0, location: 'Depot A', status: 'AVAILABLE', fuelLevel: 100, lastService: new Date().toISOString() };
+  const vehicle = { ...parsed.data, workspace: req.user.workspace, currentLoad: 0, location: 'Depot A', status: 'AVAILABLE', fuelLevel: 100, lastService: new Date().toISOString() };
   store.vehicles.push(vehicle);
   res.status(201).json(vehicle);
 });
@@ -194,12 +326,12 @@ app.patch('/api/vehicles/:id', requireAuth, requirePermission('vehicles.update')
   const schema = z.object({ registration: z.string().min(1).optional(), capacity: z.number().positive().optional(), driver: z.string().min(1).optional(), driverId: z.string().nullable().optional(), status: z.enum(['AVAILABLE', 'ASSIGNED', 'EN_ROUTE', 'COLLECTING', 'MAINTENANCE', 'OFFLINE']).optional() });
   const parsed = schema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: 'Invalid vehicle update', details: parsed.error.flatten() });
-  const vehicle = store.vehicles.find(item => item.id === req.params.id);
+  const vehicle = store.vehicles.find(item => item.id === req.params.id && ownedResource(req.user, item));
   if (!vehicle) return res.status(404).json({ error: 'Vehicle not found' });
   const before = { status: vehicle.status, driver: vehicle.driver };
   Object.assign(vehicle, parsed.data);
   if (parsed.data.driverId !== undefined) {
-    const driver = parsed.data.driverId && store.drivers.find(item => item.id === parsed.data.driverId);
+    const driver = parsed.data.driverId && store.drivers.find(item => item.id === parsed.data.driverId && ownedResource(req.user, item));
     if (parsed.data.driverId && !driver) return res.status(404).json({ error: 'Driver not found' });
     vehicle.driver = driver?.name || '';
     store.drivers.forEach(item => { if (item.vehicleId === vehicle.id) item.vehicleId = null; });
@@ -209,13 +341,14 @@ app.patch('/api/vehicles/:id', requireAuth, requirePermission('vehicles.update')
   res.json(vehicle);
 });
 app.delete('/api/vehicles/:id', requireAuth, requirePermission('vehicles.delete'), (req, res) => {
-  const index = store.vehicles.findIndex(item => item.id === req.params.id);
+  const index = store.vehicles.findIndex(item => item.id === req.params.id && ownedResource(req.user, item));
   if (index < 0) return res.status(404).json({ error: 'Vehicle not found' });
   const [vehicle] = store.vehicles.splice(index, 1);
   res.json({ success: true, id: vehicle.id });
 });
 app.get('/api/routes', requireAuth, requirePermission('routes.read'), (req, res) => {
-  const routes = req.user.role === ROLES.OPERATOR ? store.routes.filter(route => route.operatorId === req.user.sub) : store.routes;
+  const workspace = workspaceFor(req.user, req.query.workspace);
+  const routes = scoped(store.routes, workspace).filter(route => req.user.role === ROLES.OPERATOR ? route.operatorId === req.user.sub : true);
   res.json(routes);
 });
 app.post('/api/routes', requireAuth, requirePermission('routes.create'), (req, res) => {
@@ -226,8 +359,9 @@ app.post('/api/routes', requireAuth, requirePermission('routes.create'), (req, r
     const operator = findUser(parsed.data.operatorId);
     if (!operator || operator.role !== ROLES.OPERATOR || operator.status !== 'ACTIVE') return res.status(400).json({ error: 'An active operator is required' });
   }
-  if (parsed.data.vehicleId && !store.vehicles.some(vehicle => vehicle.id === parsed.data.vehicleId)) return res.status(404).json({ error: 'Vehicle not found' });
-  const route = { id: `R-${String(Date.now()).slice(-6)}`, ...parsed.data, status: 'PLANNED', distance: 0, createdAt: new Date().toISOString() };
+  if (parsed.data.bins.some(binId => !store.bins.some(bin => bin.id === binId && ownedResource(req.user, bin)))) return res.status(404).json({ error: 'One or more bins are not in the selected workspace' });
+  if (parsed.data.vehicleId && !store.vehicles.some(vehicle => vehicle.id === parsed.data.vehicleId && ownedResource(req.user, vehicle))) return res.status(404).json({ error: 'Vehicle not found' });
+  const route = { id: `R-${String(Date.now()).slice(-6)}`, ...parsed.data, workspace: req.user.workspace, status: 'PLANNED', distance: 0, createdAt: new Date().toISOString() };
   store.routes.unshift(route);
   res.status(201).json(route);
 });
@@ -235,24 +369,24 @@ app.patch('/api/routes/:id', requireAuth, requirePermission('routes.update'), (r
   const schema = z.object({ name: z.string().min(1).optional(), bins: z.array(z.string().min(1)).min(1).optional(), operatorId: z.string().nullable().optional(), vehicleId: z.string().nullable().optional() });
   const parsed = schema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: 'Invalid route update', details: parsed.error.flatten() });
-  const route = store.routes.find(item => item.id === req.params.id);
+  const route = store.routes.find(item => item.id === req.params.id && ownedResource(req.user, item));
   if (!route) return res.status(404).json({ error: 'Route not found' });
   if (parsed.data.operatorId) {
     const operator = findUser(parsed.data.operatorId);
     if (!operator || operator.role !== ROLES.OPERATOR || operator.status !== 'ACTIVE') return res.status(400).json({ error: 'An active operator is required' });
   }
-  if (parsed.data.vehicleId && !store.vehicles.some(vehicle => vehicle.id === parsed.data.vehicleId)) return res.status(404).json({ error: 'Vehicle not found' });
+  if (parsed.data.vehicleId && !store.vehicles.some(vehicle => vehicle.id === parsed.data.vehicleId && ownedResource(req.user, vehicle))) return res.status(404).json({ error: 'Vehicle not found' });
   Object.assign(route, parsed.data);
   res.json(route);
 });
 app.delete('/api/routes/:id', requireAuth, requirePermission('routes.delete'), (req, res) => {
-  const index = store.routes.findIndex(item => item.id === req.params.id);
+  const index = store.routes.findIndex(item => item.id === req.params.id && ownedResource(req.user, item));
   if (index < 0) return res.status(404).json({ error: 'Route not found' });
   const [route] = store.routes.splice(index, 1);
   res.json({ success: true, id: route.id });
 });
 app.patch('/api/routes/:id/status', requireAuth, (req, res) => {
-  const route = store.routes.find(item => item.id === req.params.id);
+  const route = store.routes.find(item => item.id === req.params.id && ownedResource(req.user, item));
   if (!route) return res.status(404).json({ error: 'Route not found' });
   const status = String(req.body?.status || '').toUpperCase();
   if (!['PLANNED', 'IN_PROGRESS', 'PAUSED', 'COMPLETED', 'CANCELLED'].includes(status)) return res.status(400).json({ error: 'Invalid route status' });
@@ -261,12 +395,13 @@ app.patch('/api/routes/:id/status', requireAuth, (req, res) => {
   route.status = status;
   res.json(route);
 });
-app.get('/api/locations', requireAuth, requirePermission('locations.read'), (_, res) => res.json(store.locations));
+app.get('/api/locations', requireAuth, requirePermission('locations.read'), (req, res) => res.json(scoped(store.locations, workspaceFor(req.user, req.query.workspace))));
 app.post('/api/locations', requireAuth, requirePermission('locations.create'), (req, res) => {
   const schema = z.object({ name: z.string().min(1), area: z.string().min(1), latitude: z.number(), longitude: z.number() });
   const parsed = schema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: 'Invalid location payload', details: parsed.error.flatten() });
-  const location = { id: `LOC-${Date.now()}`, ...parsed.data, city: 'Hyderabad', state: 'Telangana', workspace: 'Hyderabad Operations' };
+  const city = store.cityConfigs[req.user.workspace];
+  const location = { id: `LOC-${Date.now()}`, ...parsed.data, city: city.city, state: city.state, workspace: req.user.workspace };
   store.locations.unshift(location);
   res.status(201).json(location);
 });
@@ -274,23 +409,25 @@ app.patch('/api/locations/:id', requireAuth, requirePermission('locations.update
   const schema = z.object({ name: z.string().min(1).optional(), area: z.string().min(1).optional(), latitude: z.number().optional(), longitude: z.number().optional() });
   const parsed = schema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: 'Invalid location update', details: parsed.error.flatten() });
-  const location = store.locations.find(item => item.id === req.params.id);
+  const location = store.locations.find(item => item.id === req.params.id && ownedResource(req.user, item));
   if (!location) return res.status(404).json({ error: 'Location not found' });
   Object.assign(location, parsed.data);
   res.json(location);
 });
 app.delete('/api/locations/:id', requireAuth, requirePermission('locations.delete'), (req, res) => {
-  const index = store.locations.findIndex(item => item.id === req.params.id);
+  const index = store.locations.findIndex(item => item.id === req.params.id && ownedResource(req.user, item));
   if (index < 0) return res.status(404).json({ error: 'Location not found' });
   const [location] = store.locations.splice(index, 1);
   res.json({ success: true, id: location.id });
 });
 app.get('/api/tasks', requireAuth, requirePermission('tasks.read'), (req, res) => {
-  const tasks = req.user.role === ROLES.OPERATOR ? store.tasks.filter(task => task.assigneeId === req.user.sub) : store.tasks;
+  const workspace = workspaceFor(req.user, req.query.workspace);
+  const tasks = scoped(store.tasks, workspace).filter(task => req.user.role === ROLES.OPERATOR ? task.assigneeId === req.user.sub : true);
   res.json(tasks);
 });
 app.get('/api/collections', requireAuth, requirePermission('tasks.read'), (req, res) => {
-  const tasks = req.user.role === ROLES.OPERATOR ? store.tasks.filter(task => task.assigneeId === req.user.sub) : store.tasks;
+  const workspace = workspaceFor(req.user, req.query.workspace);
+  const tasks = scoped(store.tasks, workspace).filter(task => req.user.role === ROLES.OPERATOR ? task.assigneeId === req.user.sub : true);
   res.json(tasks);
 });
 app.post('/api/tasks', requireAuth, requirePermission('tasks.create'), (req, res) => {
@@ -306,7 +443,7 @@ app.post('/api/tasks', requireAuth, requirePermission('tasks.create'), (req, res
   if (!parsed.success) return res.status(400).json({ error: 'Invalid collection task payload', details: parsed.error.flatten() });
 
   const { bins, vehicleId, source, priority, reason } = parsed.data;
-  const vehicle = store.vehicles.find(item => item.id === vehicleId);
+  const vehicle = store.vehicles.find(item => item.id === vehicleId && ownedResource(req.user, item));
   if (!vehicle) return res.status(404).json({ error: 'Vehicle not found' });
 
   try {
@@ -316,7 +453,7 @@ app.post('/api/tasks', requireAuth, requirePermission('tasks.create'), (req, res
       const assignee = findUser(assigneeId);
       if (!assignee || assignee.role !== ROLES.OPERATOR || assignee.status !== 'ACTIVE') return res.status(400).json({ error: 'An active operator is required' });
     }
-    const task = agent.createCollectionTask({ bins, vehicleId, source, priority, reason, assigneeId });
+    const task = agent.createCollectionTask({ bins, vehicleId, source, priority, reason, assigneeId, workspace: req.user.workspace });
     store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: 'Created collection task', resource: 'task', resourceId: task.id, timestamp: new Date().toISOString(), metadata: { assigneeId, bins } });
     res.status(201).json({ success: true, data: task, message: 'Collection task created', ...task });
   } catch (error) {
@@ -336,7 +473,7 @@ app.post('/api/collections', requireAuth, requirePermission('tasks.create'), (re
   if (!parsed.success) return res.status(400).json({ error: 'Invalid collection task payload', details: parsed.error.flatten() });
 
   const { bins, vehicleId, source, priority, reason } = parsed.data;
-  const vehicle = store.vehicles.find(item => item.id === vehicleId);
+  const vehicle = store.vehicles.find(item => item.id === vehicleId && ownedResource(req.user, item));
   if (!vehicle) return res.status(404).json({ error: 'Vehicle not found' });
 
   try {
@@ -346,7 +483,7 @@ app.post('/api/collections', requireAuth, requirePermission('tasks.create'), (re
       const assignee = findUser(assigneeId);
       if (!assignee || assignee.role !== ROLES.OPERATOR || assignee.status !== 'ACTIVE') return res.status(400).json({ error: 'An active operator is required' });
     }
-    const task = agent.createCollectionTask({ bins, vehicleId, source, priority, reason, assigneeId });
+    const task = agent.createCollectionTask({ bins, vehicleId, source, priority, reason, assigneeId, workspace: req.user.workspace });
     store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: 'Created collection task', resource: 'task', resourceId: task.id, timestamp: new Date().toISOString(), metadata: { assigneeId, bins } });
     res.status(201).json(task);
   } catch (error) {
@@ -354,13 +491,13 @@ app.post('/api/collections', requireAuth, requirePermission('tasks.create'), (re
   }
 });
 app.get('/api/tasks/:id', requireAuth, requirePermission('tasks.read'), (req, res) => {
-  const task = store.tasks.find(item => item.id === req.params.id);
+  const task = store.tasks.find(item => item.id === req.params.id && ownedResource(req.user, item));
   if (!task) return res.status(404).json({ error: 'Collection task not found' });
   if (req.user.role === ROLES.OPERATOR && task.assigneeId !== req.user.sub) return res.status(403).json({ error: 'Task is not assigned to you' });
   res.json({ success: true, data: task, message: 'Task loaded', ...task });
 });
 app.get('/api/collections/:id', requireAuth, requirePermission('tasks.read'), (req, res) => {
-  const task = store.tasks.find(item => item.id === req.params.id);
+  const task = store.tasks.find(item => item.id === req.params.id && ownedResource(req.user, item));
   if (!task) return res.status(404).json({ error: 'Collection task not found' });
   if (req.user.role === ROLES.OPERATOR && task.assigneeId !== req.user.sub) return res.status(403).json({ error: 'Task is not assigned to you' });
   res.json(task);
@@ -369,7 +506,7 @@ app.patch('/api/collections/:id/details', requireAuth, requirePermission('tasks.
   const schema = z.object({ priority: z.enum(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']).optional(), reason: z.string().min(1).max(500).optional(), dueAt: z.string().datetime().optional(), vehicleId: z.string().optional(), assigneeId: z.string().nullable().optional() });
   const parsed = schema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: 'Invalid task update', details: parsed.error.flatten() });
-  const task = store.tasks.find(item => item.id === req.params.id);
+  const task = store.tasks.find(item => item.id === req.params.id && ownedResource(req.user, item));
   if (!task) return res.status(404).json({ error: 'Collection task not found' });
   if (parsed.data.assigneeId) {
     const assignee = findUser(parsed.data.assigneeId);
@@ -389,7 +526,7 @@ app.patch('/api/collections/:id/details', requireAuth, requirePermission('tasks.
 app.patch('/api/collections/:id/assign', requireAuth, requirePermission('tasks.assign'), (req, res) => {
   const assignment = z.object({ vehicleId: z.string().min(1).optional(), driverId: z.string().min(1).optional(), assigneeId: z.string().min(1).optional() }).safeParse(req.body || {});
   if (!assignment.success) return res.status(400).json({ error: 'Invalid assignment payload' });
-  const task = store.tasks.find(item => item.id === req.params.id);
+  const task = store.tasks.find(item => item.id === req.params.id && ownedResource(req.user, item));
   if (!task) return res.status(404).json({ error: 'Collection task not found' });
   if (assignment.data.driverId || assignment.data.vehicleId) {
     try { agent.reassignTaskResources(task.id, { driverId: assignment.data.driverId, vehicleId: assignment.data.vehicleId }); }
@@ -405,7 +542,7 @@ app.patch('/api/collections/:id/assign', requireAuth, requirePermission('tasks.a
   store.persistOperationalState();
   res.json(task);
 });
-app.get('/api/incidents', requireAuth, (_, res) => res.json(store.incidents));
+app.get('/api/incidents', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => res.json(scoped(store.incidents, workspaceFor(req.user, req.query.workspace))));
 app.post('/api/incidents', requireAuth, requirePermission('alerts.report'), (req, res) => {
   const schema = z.object({
     location: z.string().min(1),
@@ -418,29 +555,42 @@ app.post('/api/incidents', requireAuth, requirePermission('alerts.report'), (req
   const parsed = schema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: 'Invalid incident report', details: parsed.error.flatten() });
 
-  const incident = agent.reportIncident(parsed.data);
+  const incident = agent.reportIncident({ ...parsed.data, workspace: req.user.workspace, reporter: req.user.email });
   res.status(201).json(incident);
 });
-app.get('/api/notifications', requireAuth, (_, res) => res.json(store.notifications));
+app.get('/api/notifications', requireAuth, (req, res) => {
+  const notifications = req.user.role === ROLES.ADMIN
+    ? store.notifications
+    : [ROLES.VIEWER, ROLES.CITIZEN].includes(req.user.role)
+      ? store.notifications.filter(item => item.recipientId === req.user.sub || item.recipientEmail === req.user.email)
+      : store.notifications.filter(item => !item.recipientId || item.recipientId === req.user.sub || item.recipientEmail === req.user.email);
+  res.json(notifications);
+});
 app.patch('/api/notifications/:id/read', requireAuth, (req, res) => {
   const notification = store.notifications.find(item => item.id === req.params.id);
   if (!notification) return res.status(404).json({ error: 'Notification not found' });
+  if (req.user.role !== ROLES.ADMIN && notification.recipientId && notification.recipientId !== req.user.sub && notification.recipientEmail !== req.user.email) return res.status(403).json({ error: 'Notification is not assigned to you' });
   notification.read = true;
   res.json(notification);
 });
 app.patch('/api/notifications/read-all', requireAuth, (req, res) => {
-  store.notifications.forEach(item => { item.read = true; });
-  res.json({ success: true, count: store.notifications.length });
+  const visible = req.user.role === ROLES.ADMIN
+    ? store.notifications
+    : [ROLES.VIEWER, ROLES.CITIZEN].includes(req.user.role)
+      ? store.notifications.filter(item => item.recipientId === req.user.sub || item.recipientEmail === req.user.email)
+      : store.notifications.filter(item => !item.recipientId || item.recipientId === req.user.sub || item.recipientEmail === req.user.email);
+  visible.forEach(item => { item.read = true; });
+  res.json({ success: true, count: visible.length });
 });
 app.get('/api/audit-logs', requireAuth, requirePermission('audit.read'), (_, res) => res.json(store.auditLogs));
-app.get('/api/drivers', requireAuth, requirePermission('drivers.read'), (_, res) => res.json(store.drivers.map(driver => ({ ...driver, currentTask: store.tasks.find(task => task.driver === driver.name && !['COMPLETED', 'VERIFIED', 'CANCELLED'].includes(task.status)) || null, taskHistory: store.tasks.filter(task => task.driver === driver.name) }))));
+app.get('/api/drivers', requireAuth, requirePermission('drivers.read'), (req, res) => { const workspace = workspaceFor(req.user, req.query.workspace); res.json(scoped(store.drivers, workspace).map(driver => ({ ...driver, currentTask: store.tasks.find(task => task.workspace === workspace && task.driver === driver.name && !['COMPLETED', 'VERIFIED', 'CANCELLED'].includes(task.status)) || null, taskHistory: store.tasks.filter(task => task.workspace === workspace && task.driver === driver.name) }))); });
 app.patch('/api/drivers/:id', requireAuth, requirePermission('drivers.update'), (req, res) => {
   const schema = z.object({ name: z.string().min(1).optional(), phone: z.string().min(1).optional(), licenseNumber: z.string().min(1).optional(), status: z.enum(['ONLINE', 'OFFLINE', 'ON_ROUTE', 'ON_BREAK', 'BUSY']).optional(), vehicleId: z.string().nullable().optional() });
   const parsed = schema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: 'Invalid driver update', details: parsed.error.flatten() });
-  const driver = store.drivers.find(item => item.id === req.params.id);
+  const driver = store.drivers.find(item => item.id === req.params.id && ownedResource(req.user, item));
   if (!driver) return res.status(404).json({ error: 'Driver not found' });
-  if (parsed.data.vehicleId && !store.vehicles.some(item => item.id === parsed.data.vehicleId)) return res.status(404).json({ error: 'Vehicle not found' });
+  if (parsed.data.vehicleId && !store.vehicles.some(item => item.id === parsed.data.vehicleId && ownedResource(req.user, item))) return res.status(404).json({ error: 'Vehicle not found' });
   Object.assign(driver, parsed.data);
   store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: 'Updated driver', resource: 'driver', resourceId: driver.id, timestamp: new Date().toISOString(), metadata: parsed.data });
   res.json(driver);
@@ -452,15 +602,18 @@ app.post('/api/agents/route-optimize', requireAuth, requireRole('ADMIN'), async 
 });
 app.post('/api/agents/overflow-predict', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
   const binId = String(req.body?.binId || '').trim();
-  const bins = agent.getBinStatus();
+  const bins = agent.getBinStatus(req.user.workspace);
   const predictions = binId ? bins.filter(bin => bin.id === binId) : bins.filter(bin => ['CRITICAL', 'HIGH', 'MEDIUM'].includes(bin.priority));
   res.json({ success: true, message: 'Overflow predictions loaded', data: predictions, predictions });
 });
 app.post('/api/agents/dispatch', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
   const payload = req.body || {};
   const selectedBins = Array.isArray(payload.bins) && payload.bins.length ? payload.bins : ['HYG-001'];
-  const vehicleId = payload.vehicleId || agent.getAvailableVehiclesForBins(selectedBins.map(id => ({ id }))).find(Boolean)?.id || store.vehicles[0]?.id;
-  const task = agent.createCollectionTask({ bins: selectedBins, vehicleId, source: payload.source || 'AI', priority: payload.priority || 'HIGH', reason: payload.reason || 'Dispatch recommendation' });
+  const workspaceBins = selectedBins.map(id => store.bins.find(bin => bin.id === id && ownedResource(req.user, bin)));
+  if (workspaceBins.some(bin => !bin)) return res.status(404).json({ error: 'One or more bins are not in the selected workspace' });
+  const vehicleId = payload.vehicleId || agent.getAvailableVehiclesForBins(workspaceBins).find(Boolean)?.id;
+  if (!vehicleId) return res.status(400).json({ error: 'No available vehicle in the selected workspace' });
+  const task = agent.createCollectionTask({ bins: selectedBins, vehicleId, workspace: req.user.workspace, source: payload.source || 'AI', priority: payload.priority || 'HIGH', reason: payload.reason || 'Dispatch recommendation' });
   res.status(201).json({ success: true, message: 'Dispatch generated', data: task, ...task });
 });
 app.get('/api/agents/activity', requireAuth, requirePermission('agents.read'), (_, res) => res.json(store.auditLogs.filter(log => ['task', 'vehicle', 'alert', 'agent'].includes(log.resource)).slice(0, 20)));
@@ -488,8 +641,8 @@ app.get('/api/analytics', requireAuth, requirePermission('analytics.read'), (req
   const payload = getDashboardState(req.user.workspace || 'Hyderabad Operations', req.user);
   res.json({ success: true, message: 'Analytics loaded', data: payload, ...payload });
 });
-app.get('/api/reports', requireAuth, requirePermission('reports.read'), (req, res) => res.json({ generatedAt: new Date().toISOString(), metrics: getDashboardState(req.user.workspace || 'Hyderabad Operations', req.user).metrics, tasks: req.user.role === ROLES.OPERATOR ? store.tasks.filter(task => task.assigneeId === req.user.sub) : store.tasks }));
-app.get('/api/ai/status', requireAuth, (_, res) => res.json({
+app.get('/api/reports', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => { const workspace = workspaceFor(req.user, req.query.workspace); const tasks = scoped(store.tasks, workspace).filter(task => req.user.role === ROLES.OPERATOR ? task.assigneeId === req.user.sub : true); res.json({ generatedAt: new Date().toISOString(), metrics: getDashboardState(workspace, req.user).metrics, tasks }); });
+app.get('/api/ai/status', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => res.json({
   online: true,
   mode: process.env.OPENAI_API_KEY || process.env.LLM_API_KEY ? 'LLM' : 'LOCAL_RULE_ENGINE',
   lastRun: store.aiRuns[0] || null,
@@ -505,7 +658,7 @@ app.post('/api/ai/run', requireAuth, requireRole('ADMIN'), async (_, res) => {
   const run = await agent.runOptimization('manual', _.user);
   res.status(201).json(run);
 });
-app.post('/api/agent/query', requireAuth, async (req, res) => {
+app.post('/api/agent/query', requireAuth, requireRole('ADMIN', 'OPERATOR'), async (req, res) => {
   const query = String(req.body?.query || '').trim();
   if (!query) return res.status(400).json({ error: 'Ask a question or give the operations agent a command.' });
 
@@ -522,7 +675,7 @@ app.post('/api/agent/query', requireAuth, async (req, res) => {
   }
 });
 app.patch('/api/collections/:id', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
-  const task = store.tasks.find(item => item.id === req.params.id);
+  const task = store.tasks.find(item => item.id === req.params.id && ownedResource(req.user, item));
   if (!task) return res.status(404).json({ error: 'Collection task not found' });
   if (req.user.role === ROLES.OPERATOR && task.assigneeId !== req.user.sub) return res.status(403).json({ error: 'Task is not assigned to you' });
 
@@ -549,13 +702,22 @@ app.patch('/api/collections/:id', requireAuth, requireRole('ADMIN', 'OPERATOR'),
 
   res.json(task);
 });
-app.get('/api/alerts', requireAuth, requirePermission('alerts.read'), (_, res) => res.json(store.incidents));
+app.post('/api/collections/:id/demo-start', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
+  const task = store.tasks.find(item => item.id === req.params.id && ownedResource(req.user, item));
+  if (!task) return res.status(404).json({ error: 'Collection task not found' });
+  if (req.user.role === ROLES.OPERATOR && task.assigneeId !== req.user.sub) return res.status(403).json({ error: 'Task is not assigned to you' });
+  try {
+    const updated = agent.startResponseDemo(task.id, Number(req.body?.delayMs) || undefined);
+    res.json({ success: true, data: updated, ...updated });
+  } catch (error) { res.status(400).json({ error: error.message }); }
+});
+app.get('/api/alerts', requireAuth, requirePermission('alerts.read'), (req, res) => res.json(scoped(store.incidents, workspaceFor(req.user, req.query.workspace))));
 app.patch('/api/alerts/:id/status', requireAuth, requireRole('ADMIN', 'OPERATOR'), (req, res) => {
   const requestedStatus = String(req.body?.status || '').toUpperCase();
   const isAdmin = req.user.role === ROLES.ADMIN;
   if (requestedStatus === 'RESOLVED' && !isAdmin) return res.status(403).json({ error: 'Only administrators can resolve alerts' });
   if (!isAdmin && !['ACKNOWLEDGED', 'IN_PROGRESS'].includes(requestedStatus)) return res.status(403).json({ error: 'Operators can only acknowledge or progress alerts' });
-  if (!isAdmin && !store.incidents.find(item => item.id === req.params.id)) return res.status(404).json({ error: 'Alert not found' });
+  if (!store.incidents.find(item => item.id === req.params.id && ownedResource(req.user, item))) return res.status(404).json({ error: 'Alert not found' });
   try {
     const incident = agent.updateIncident(req.params.id, requestedStatus);
     store.auditLogs.unshift({ id: `AL-${Date.now()}`, user: req.user.email, role: req.user.role, action: `Changed alert status to ${requestedStatus}`, resource: 'alert', resourceId: incident.id, timestamp: new Date().toISOString(), metadata: {} });
@@ -565,6 +727,7 @@ app.patch('/api/alerts/:id/status', requireAuth, requireRole('ADMIN', 'OPERATOR'
 app.use((err, _, res, __) => res.status(500).json({ success: false, error: 'Unexpected server error', message: err.message }));
 
 const server = app.listen(port, () => console.log(`EcoFlow API listening on http://localhost:${port}`));
+process.env.SENSOR_SIMULATOR_TOKEN = issueToken(findUser('U-001'));
 const runScheduledOptimization = async () => {
   if (!automation.enabled) return;
   try {
@@ -584,6 +747,7 @@ if (automation.enabled) {
   runScheduledOptimization();
   setInterval(runScheduledOptimization, automation.intervalMs);
 }
+sensorSimulator.startSensorSimulator();
 server.on('error', error => {
   if (error.code === 'EADDRINUSE') {
     console.error(`EcoFlow API is already running on port ${port}; refusing to start a duplicate server.`);

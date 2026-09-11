@@ -7,6 +7,7 @@ const path = require('path');
 const MEMORY_FILE = path.join(__dirname, '..', 'agent-memory.json');
 const TERMINAL_TASK_STATUSES = new Set(['COMPLETED', 'VERIFIED', 'CANCELLED']);
 const agentRuntime = { state: 'ONLINE', updatedAt: new Date().toISOString(), lastError: null };
+const responseExecutions = new Set();
 function setAgentState(state, error = null) { agentRuntime.state = state; agentRuntime.updatedAt = new Date().toISOString(); agentRuntime.lastError = error; }
 function persistOperationalMemory() {
   const payload = {
@@ -93,6 +94,18 @@ function predictedOverflow(bin) {
   return { hours: Number(hours.toFixed(1)), at: new Date(Date.now() + hours * 3600000).toISOString() };
 }
 
+function computeFillFromUltrasonic({ emptyDistance, fullDistance, currentDistance }) {
+  const empty = Number(emptyDistance);
+  const full = Number(fullDistance);
+  const current = Number(currentDistance);
+  if (!Number.isFinite(empty) || !Number.isFinite(full) || !Number.isFinite(current)) {
+    throw new Error('Ultrasonic calibration values must be numeric.');
+  }
+  if (empty <= full) throw new Error('EMPTY_DISTANCE must be greater than FULL_DISTANCE.');
+  const raw = ((empty - current) / (empty - full)) * 100;
+  return Math.min(100, Math.max(0, raw));
+}
+
 function priorityFor(bin, forecast) {
   if (!bin) return 'LOW';
   if (bin.fill >= 95 || forecast.hours < 2) return 'CRITICAL';
@@ -101,8 +114,266 @@ function priorityFor(bin, forecast) {
   return 'LOW';
 }
 
-function getBinStatus() {
-  return store.bins.map(bin => {
+function determineTelemetrySource(source = '') {
+  const normalized = String(source || '').toLowerCase();
+  if (normalized === 'iot' || normalized === 'iot_sensor') return 'IoT_SENSOR';
+  if (normalized === 'simulated' || normalized === 'simulation') return 'SIMULATED';
+  return 'IoT_SENSOR';
+}
+
+function handleTelemetry(payload, user = { role: 'ADMIN' }) {
+  const role = user?.role || 'ADMIN';
+  if (!['ADMIN', 'OPERATOR'].includes(role)) {
+    throw new Error('Unauthorized telemetry write.');
+  }
+  if (!payload || typeof payload !== 'object') throw new Error('Telemetry payload required.');
+  const binId = String(payload.binId || '').trim();
+  if (!/^(HYG|WYG)-\d{3,}$/.test(binId)) throw new Error('Malformed bin ID.');
+  const bin = store.bins.find(item => item.id === binId && item.workspace === (user?.workspace || 'Hyderabad Operations'));
+  if (!bin) throw new Error('Bin not found.');
+  const fillLevel = Number(payload.fillLevel);
+  if (!Number.isFinite(fillLevel) || fillLevel < 0 || fillLevel > 100) throw new Error('Fill level must be between 0 and 100%.');
+  const weightKg = Number(payload.weightKg);
+  if (!Number.isFinite(weightKg) || weightKg < 0) throw new Error('Weight must be a non-negative number.');
+  const timestamp = payload.timestamp ? new Date(payload.timestamp).toISOString() : new Date().toISOString();
+  if (Number.isNaN(Date.parse(payload.timestamp || new Date().toISOString()))) throw new Error('Invalid timestamp.');
+  const now = Date.now();
+  const ageMinutes = (now - Date.parse(timestamp)) / 60000;
+  if (ageMinutes > 15) throw new Error('Telemetry is stale.');
+  if (payload.sensorId && !String(payload.sensorId).trim()) throw new Error('Missing sensor identifier.');
+
+  const record = {
+    id: `TEL-${Date.now()}`,
+    binId,
+    fillLevel,
+    weightKg,
+    temperature: payload.temperature != null ? Number(payload.temperature) : null,
+    humidity: payload.humidity != null ? Number(payload.humidity) : null,
+    timestamp,
+    source: determineTelemetrySource(payload.source),
+    sensorId: payload.sensorId || bin.sensorId || 'UNKNOWN_SENSOR',
+    accepted: true
+  };
+
+  const previousFill = Number(bin.fill || 0);
+  store.telemetry.unshift(record);
+  bin.fill = Number(fillLevel.toFixed(1));
+  bin.fillRate = Math.max(0.5, Number((Math.max(0, fillLevel - previousFill) * 12).toFixed(1)));
+  bin.temperature = record.temperature != null ? record.temperature : bin.temperature;
+  bin.weightKg = weightKg;
+  bin.lastTelemetryAt = timestamp;
+  bin.dataSource = record.source;
+  bin.sensorId = record.sensorId;
+  bin.sensorStatus = ageMinutes > 5 ? 'STALE' : 'ONLINE';
+  bin.priority = priorityFor(bin, predictedOverflow(bin));
+  bin.status = bin.priority === 'CRITICAL' ? 'CRITICAL' : bin.priority === 'HIGH' ? 'HIGH' : bin.priority === 'MEDIUM' ? 'MEDIUM' : 'NORMAL';
+  bin.modifiedAt = timestamp;
+  store.sensorMetadata.unshift({ id: `SENS-${Date.now()}`, binId, sensorId: record.sensorId, source: record.source, status: bin.sensorStatus, lastReadingAt: timestamp, signal: 'GOOD', battery: bin.battery || 100 });
+  store.persistOperationalState();
+  return { accepted: true, binId, fillLevel, source: record.source, sensorId: record.sensorId, timestamp, priority: bin.priority };
+}
+
+function predictBinFill(binId, timestamp = new Date()) {
+  const bin = store.bins.find(item => item.id === binId);
+  if (!bin) throw new Error(`Bin ${binId} not found.`);
+  const time = new Date(timestamp);
+  const dayOfWeek = time.toLocaleString('en-US', { weekday: 'long', timeZone: 'UTC' }).toUpperCase();
+  const hour = time.getUTCHours();
+  const dayPattern = { MONDAY: 0.9, TUESDAY: 0.95, WEDNESDAY: 1.0, THURSDAY: 1.08, FRIDAY: 1.35, SATURDAY: 1.28, SUNDAY: 0.7 };
+  const timePattern = hour >= 7 && hour <= 10 ? 1.12 : hour >= 11 && hour <= 15 ? 1.0 : hour >= 16 && hour <= 20 ? 1.08 : 0.92;
+  const recent = store.telemetry.filter(item => item.binId === binId).slice(0, 5);
+  const recentGrowth = recent.length ? recent.reduce((sum, item) => sum + item.fillLevel, 0) / recent.length - bin.fill : 0;
+  const historical = (store.history || []).filter(item => item.binId === binId && item.dayOfWeek === dayOfWeek).slice(-5);
+  const historicalAverage = historical.length ? historical.reduce((sum, item) => sum + Number(item.fillLevel || 0), 0) / historical.length : bin.fill;
+  const currentFill = Number(bin.fill || 0);
+  const predictedFill1h = Math.min(100, Number((currentFill + (recentGrowth * 1.8) + (historicalAverage * 0.16) * dayPattern[dayOfWeek] * timePattern).toFixed(1)));
+  const predictedFill2h = Math.min(100, Number((currentFill + (recentGrowth * 2.4) + (historicalAverage * 0.22) * dayPattern[dayOfWeek] * timePattern).toFixed(1)));
+  const predictedFill3h = Math.min(100, Number((currentFill + (recentGrowth * 3.0) + (historicalAverage * 0.28) * dayPattern[dayOfWeek] * timePattern).toFixed(1)));
+  const publicReports = store.publicReports.filter(report => report.linkedBinId === binId || report.location === bin.location).length;
+  const overflowRisk = predictedFill3h >= 95 || publicReports > 0 ? 'CRITICAL' : predictedFill3h >= 85 ? 'HIGH' : predictedFill3h >= 72 ? 'MEDIUM' : 'LOW';
+  const confidence = Math.min(0.99, Math.max(0.45, Number(((0.42 + (currentFill / 100) * 0.25 + (publicReports ? 0.12 : 0) + (dayPattern[dayOfWeek] - 0.7) * 0.18 + (recent.length ? 0.12 : 0)).toFixed(2)))));
+  const factors = [
+    `Current sensor fill is ${currentFill}%`,
+    `${dayOfWeek} historical pattern is elevated`,
+    `Recent fill growth is ${recentGrowth >= 0 ? 'increasing' : 'stable'}`,
+    publicReports ? `Recent public report detected (${publicReports})` : 'No recent public report detected'
+  ];
+
+  return {
+    binId: bin.id,
+    currentFill,
+    predictedFill1h,
+    predictedFill2h,
+    predictedFill3h,
+    overflowRisk,
+    confidence,
+    factors,
+    source: 'AGENT_DERIVED',
+    historicalAverage,
+    publicReports
+  };
+}
+
+function analyzePublicReportPhoto(photoData = '') {
+  const hasData = typeof photoData === 'string' && photoData.length > 120;
+  const overflowSuspected = hasData && /png|jpg|jpeg|image/.test(photoData.toLowerCase());
+  return {
+    wasteDetected: hasData,
+    overflowSuspected,
+    severity: overflowSuspected ? 'HIGH' : 'MEDIUM',
+    confidence: overflowSuspected ? 0.89 : 0.55,
+    source: 'AI_ASSISTED_PROTOTYPE'
+  };
+}
+
+function workspaceForCoordinates(latitude, longitude) {
+  return Object.values(store.cityConfigs).sort((a, b) =>
+    Math.hypot(a.latitude - latitude, a.longitude - longitude) - Math.hypot(b.latitude - latitude, b.longitude - longitude)
+  )[0]?.workspace || 'Hyderabad Operations';
+}
+
+function submitPublicReport(payload = {}, user = { role: 'PUBLIC' }) {
+  const role = user?.role || 'PUBLIC';
+  if (role !== 'PUBLIC' && role !== 'CITIZEN' && role !== 'VIEWER' && role !== 'OPERATOR' && role !== 'ADMIN') {
+    throw new Error('Unauthorized report submission.');
+  }
+  if (!payload || typeof payload !== 'object') throw new Error('Public report payload required.');
+  const issueType = String(payload.issueType || 'OTHER').toUpperCase();
+  const validIssues = new Set(['OVERFLOWING_BIN', 'GARBAGE_DUMPED_OUTSIDE_BIN', 'MISSED_COLLECTION', 'ILLEGAL_DUMPING', 'DAMAGED_BIN', 'OTHER_WASTE_ISSUE']);
+  if (!validIssues.has(issueType)) throw new Error('Invalid issue type.');
+  const photo = String(payload.photo || '').trim();
+  if (!photo) throw new Error('Photo is required.');
+  const imageMatch = photo.match(/^data:image\/(png|jpeg|jpg|gif|webp);base64,([A-Za-z0-9+/=]+)$/i);
+  if (!imageMatch) throw new Error('Photo must be a base64 PNG, JPEG, GIF, or WebP image.');
+  if (photo.length > 8 * 1024 * 1024) throw new Error('Photo is too large. Maximum size is 8 MB.');
+  const imageBytes = Buffer.from(imageMatch[2], 'base64');
+  const validMagic = imageMatch[1].toLowerCase() === 'png' ? imageBytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    : imageMatch[1].toLowerCase() === 'gif' ? imageBytes.subarray(0, 3).toString() === 'GIF'
+      : imageMatch[1].toLowerCase() === 'webp' ? imageBytes.subarray(0, 4).toString() === 'RIFF' && imageBytes.subarray(8, 12).toString() === 'WEBP'
+        : imageBytes[0] === 0xff && imageBytes[1] === 0xd8 && imageBytes[2] === 0xff;
+  if (!validMagic) throw new Error('Photo content does not match its image type.');
+  const longitude = Number(payload.longitude);
+  const latitude = Number(payload.latitude);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) throw new Error('Location coordinates are required.');
+  const timestamp = payload.timestamp ? new Date(payload.timestamp).toISOString() : new Date().toISOString();
+  if (Number.isNaN(Date.parse(timestamp))) throw new Error('Invalid report timestamp.');
+  const workspace = user?.workspace || workspaceForCoordinates(latitude, longitude);
+  const requestedBin = payload.binId ? store.bins.find(bin => bin.id === payload.binId) : null;
+  if (payload.binId && (!requestedBin || requestedBin.workspace !== workspace)) throw new Error('Bin is not in the selected workspace.');
+
+  const reportId = `PR-${String(Date.now()).slice(-6)}`;
+  const linkedBinId = payload.binId || findNearestBin(latitude, longitude, workspace);
+  const analysis = analyzePublicReportPhoto(photo);
+  const report = {
+    id: reportId,
+    issueType,
+    photo,
+    photoPath: photo.startsWith('data:image/') ? `uploads/${reportId}.png` : photo,
+    latitude,
+    longitude,
+    description: String(payload.description || ''),
+    timestamp,
+    status: 'OPEN',
+    linkedBinId,
+    confidence: analysis.confidence,
+    aiAnalysis: analysis,
+    source: 'PUBLIC_REPORT',
+    workspace,
+    createdAt: new Date().toISOString(),
+    reporterId: user?.sub || null,
+    reporterEmail: user?.email || null,
+    taskId: null,
+    resolvedAt: null,
+    resolvedBy: null,
+    resolutionDetails: null
+  };
+  store.publicReports.unshift(report);
+  if (linkedBinId && store.bins.some(bin => bin.id === linkedBinId)) {
+    const bin = store.bins.find(bin => bin.id === linkedBinId);
+    bin.publicReports = Math.max(0, (bin.publicReports || 0) + 1);
+  }
+  processPublicReport(report);
+  store.persistOperationalState();
+  return report;
+}
+
+function fleetDistanceToBin(vehicle, bin) {
+  const location = store.locations?.find(item => item.name === vehicle.location || item.area === vehicle.location);
+  return location ? distanceBetween(location, bin) : Number.POSITIVE_INFINITY;
+}
+
+function findResponseFleet(bin) {
+  if (!bin) return null;
+  const demand = estimateWasteKg(bin);
+  return store.vehicles
+    .filter(vehicle => vehicle.workspace === bin.workspace)
+    .filter(vehicle => !['MAINTENANCE', 'OFFLINE'].includes(vehicle.status))
+    .map(vehicle => ({ vehicle, driver: getAvailableDriver(vehicle), distance: fleetDistanceToBin(vehicle, bin), capacity: vehicle.capacity - vehicle.currentLoad }))
+    .filter(candidate => candidate.driver && candidate.capacity >= demand)
+    .sort((a, b) => a.distance - b.distance || a.capacity - b.capacity)[0] || null;
+}
+
+function processPublicReport(report) {
+  recordAgentPhase('REPORT', 'REPORT_RECEIVED', `Received public report ${report.id}.`, { reportId: report.id });
+  recordAgentPhase('ANALYZE', 'REPORT_ANALYZED', `AI-assisted prototype analysis completed for ${report.id}.`, { reportId: report.id, analysis: report.aiAnalysis });
+  const bin = store.bins.find(item => item.id === report.linkedBinId && item.workspace === report.workspace);
+  if (!bin) return report;
+  recordAgentPhase('ANALYZE', 'BIN_IDENTIFIED', `Linked ${report.id} to ${bin.id} using report location.`, { reportId: report.id, binId: bin.id });
+  const forecast = predictedOverflow(bin);
+  const priority = priorityFor(bin, forecast);
+  const severity = report.aiAnalysis.severity === 'HIGH' || priority === 'CRITICAL' || bin.fill >= 85 ? 'CRITICAL' : priority === 'HIGH' ? 'HIGH' : report.aiAnalysis.severity;
+  report.severity = severity;
+  report.currentAction = 'SEVERITY_ASSESSED';
+  recordAgentPhase('DECIDE', 'SEVERITY_ASSESSED', `Report ${report.id} assessed as ${severity} from analysis, telemetry, and forecast.`, { reportId: report.id, binId: bin.id, priority, forecast });
+  const candidate = findResponseFleet(bin);
+  recordAgentPhase('ACT', 'FLEET_SEARCHED', `Searched available fleet for ${report.id}.`, { reportId: report.id, candidateVehicleId: candidate?.vehicle.id || null });
+  if (!candidate) {
+    report.currentAction = 'NO_FLEET_AVAILABLE';
+    store.incidents.unshift({ id: `INC-${Date.now()}`, type: 'PUBLIC_REPORT_FLEET_UNAVAILABLE', location: bin.location, workspace: report.workspace, severity, description: `No suitable fleet currently available for ${report.id}.`, relatedBinId: bin.id, relatedReportId: report.id, status: 'OPEN', reportedAt: new Date().toISOString(), aiReview: 'AGENT_DERIVED' });
+    recordAgentPhase('ACT', 'DEFER_RESPONSE', `No suitable fleet currently available for ${report.id}; monitoring will reconsider.`, { reportId: report.id, binId: bin.id });
+    return report;
+  }
+  const task = createCollectionTask({ bins: [bin.id], vehicleId: candidate.vehicle.id, driverId: candidate.driver.id, assigneeId: 'U-002', source: 'PUBLIC_REPORT_AGENT', priority: severity, workspace: report.workspace, reason: `Public report ${report.id} indicates ${report.issueType} at ${bin.id}. Current fill is ${bin.fill}%. ${candidate.vehicle.id} is the nearest available vehicle with sufficient capacity.` });
+  task.reportId = report.id;
+  task.reportLocation = { latitude: report.latitude, longitude: report.longitude, location: bin.location };
+  report.taskId = task.id;
+  report.status = 'IN_PROGRESS';
+  report.currentAction = 'TASK_CREATED';
+  report.assignedVehicleId = task.vehicle;
+  report.assignedDriverId = task.driverId;
+  recordAgentPhase('ACT', 'VEHICLE_SELECTED', `Selected ${task.vehicle} for ${report.id}.`, { reportId: report.id, vehicleId: task.vehicle });
+  recordAgentPhase('ACT', 'DRIVER_SELECTED', `Selected ${task.driver} for ${report.id}.`, { reportId: report.id, driverId: task.driverId });
+  recordAgentPhase('ACT', 'TASK_CREATED', `Created response task ${task.id} for ${report.id}.`, { reportId: report.id, taskId: task.id, binId: bin.id });
+  recordAgentPhase('ACT', 'TASK_DISPATCHED', `Dispatched ${task.id} to ${task.driver}.`, { reportId: report.id, taskId: task.id });
+  store.persistOperationalState();
+  return report;
+}
+
+function findNearestBin(latitude, longitude, workspace = workspaceForCoordinates(latitude, longitude)) {
+  const nearest = store.bins.filter(bin => bin.workspace === workspace).reduce((best, bin) => {
+    const distance = Math.hypot(bin.latitude - latitude, bin.longitude - longitude);
+    if (!best || distance < best.distance) return { bin, distance };
+    return best;
+  }, null);
+  return nearest ? nearest.bin.id : null;
+}
+
+function fusePrioritySignals(binId) {
+  const bin = store.bins.find(item => item.id === binId);
+  if (!bin) return null;
+  const sensor = Number(bin.fill || 0);
+  const publicReports = store.publicReports.filter(report => report.linkedBinId === binId || report.location === bin.location).length;
+  const historical = predictBinFill(binId, new Date());
+  const sensorConfidence = Math.min(0.9, sensor / 100);
+  const reportConfidence = publicReports ? 0.25 * publicReports : 0;
+  const historicalConfidence = historical.confidence || 0.7;
+  const confidence = Math.min(0.99, Number((sensorConfidence + reportConfidence + historicalConfidence * 0.5).toFixed(2)));
+  const priority = confidence >= 0.8 || sensor >= 90 ? 'CRITICAL' : confidence >= 0.65 ? 'HIGH' : confidence >= 0.5 ? 'MEDIUM' : 'LOW';
+  return { binId: bin.id, sensorFill: sensor, publicReports, photoEvidence: publicReports > 0, historicalRisk: historical.overflowRisk, confidence, priority, source: 'AGENT_DERIVED' };
+}
+
+function getBinStatus(workspace = null) {
+  return store.bins.filter(bin => !workspace || bin.workspace === workspace).map(bin => {
     const forecast = predictedOverflow(bin);
     const priority = priorityFor(bin, forecast);
     return {
@@ -116,15 +387,19 @@ function getBinStatus() {
 }
 
 function getWorkspaceBins(workspaceName = 'Hyderabad Operations') {
-  return store.bins.map(bin => ({
+  return store.bins.filter(bin => (bin.workspace || 'Hyderabad Operations') === workspaceName).map(bin => ({
     ...bin,
     workspace: workspaceName || 'Hyderabad Operations'
   }));
 }
 
 function getAvailableVehiclesForBins(selectedBins = []) {
+  const workspaces = new Set(selectedBins.map(bin => bin.workspace).filter(Boolean));
+  if (workspaces.size > 1) return [];
+  const workspace = [...workspaces][0];
   const estimatedDemand = selectedBins.reduce((sum, bin) => sum + estimateWasteKg(bin), 0);
   return store.vehicles
+    .filter(vehicle => !workspace || vehicle.workspace === workspace)
     .filter(vehicle => vehicle.status !== 'MAINTENANCE')
     .map(vehicle => ({
       ...vehicle,
@@ -266,13 +541,16 @@ function optimizeRoute(selectedBins, vehicle) {
   };
 }
 
-function createCollectionTask({ bins: selectedBinIds, vehicleId, driverId = null, source = 'AI', priority = 'HIGH', reason = '', assigneeId = null }) {
+function createCollectionTask({ bins: selectedBinIds, vehicleId, driverId = null, source = 'AI', priority = 'HIGH', reason = '', assigneeId = null, workspace = null }) {
   const vehicle = store.vehicles.find(item => item.id === vehicleId);
   if (!vehicle) throw new Error('Vehicle not found');
+  if (workspace && vehicle.workspace !== workspace) throw new Error('Vehicle is not in the selected workspace.');
   if (vehicle.status === 'MAINTENANCE' || vehicle.status === 'OFFLINE') throw new Error(`${vehicle.id} is unavailable for dispatch.`);
 
   const selectedBins = store.bins.filter(bin => selectedBinIds.includes(bin.id));
   if (selectedBins.length !== [...new Set(selectedBinIds)].length) throw new Error('One or more bins were not found');
+  const selectedWorkspaces = new Set(selectedBins.map(bin => bin.workspace));
+  if (selectedWorkspaces.size !== 1 || (workspace && !selectedWorkspaces.has(workspace)) || vehicle.workspace !== [...selectedWorkspaces][0]) throw new Error('Bins and vehicle must belong to the same workspace.');
   const driver = getAvailableDriver(vehicle, driverId);
   if (!driver) throw new Error(`No available driver for ${vehicle.id}.`);
   const duplicate = store.tasks.find(task => !TERMINAL_TASK_STATUSES.has(task.status) && (task.bins || []).some(binId => selectedBinIds.includes(binId)));
@@ -291,6 +569,7 @@ function createCollectionTask({ bins: selectedBinIds, vehicleId, driverId = null
     distance: route.distance,
     duration: route.duration,
     status: 'CREATED',
+    workspace: [...selectedWorkspaces][0],
     reason: reason || `${selectedBins[0]?.id || 'Collection'} requires immediate attention.`,
     createdAt: new Date().toISOString(),
     collectedQuantity: 0,
@@ -430,7 +709,41 @@ function completeTask(taskId, payload = {}) {
   task.verifiedAt = new Date().toISOString();
   task.simulatedTelemetry = payload.simulatedTelemetry === true;
   recordAgentPhase('VERIFY', 'VERIFY_COLLECTION', `${task.simulatedTelemetry ? 'Verified simulated field telemetry' : 'Verified collection telemetry'} for ${task.id}; bins, vehicle, driver, and route were updated.`, { taskId: task.id, collectedQuantity, simulatedTelemetry: task.simulatedTelemetry });
+  const report = task.reportId && store.publicReports.find(item => item.id === task.reportId);
+  if (report) {
+    report.status = 'RESOLVED';
+    report.resolvedAt = task.verifiedAt;
+    report.resolvedBy = task.id;
+    report.resolutionDetails = `Verified collection completed by ${task.driver} using ${task.vehicle}.`;
+    report.currentAction = 'ISSUE_RESOLVED';
+    store.notifications.unshift({ id: `N-${Date.now()}-${report.id}`, type: 'PUBLIC_REPORT_RESOLVED', reportId: report.id, title: 'Your waste report has been resolved', body: `The reported ${report.issueType.toLowerCase().replaceAll('_', ' ')} near ${report.linkedBinId || 'the reported location'} has been resolved. Thank you for helping keep the city clean.`, time: 'just now', read: false, recipientId: report.reporterId, recipientEmail: report.reporterEmail });
+    recordAgentPhase('VERIFY', 'ISSUE_RESOLVED', `Verified report ${report.id} after task ${task.id} completion.`, { reportId: report.id, taskId: task.id });
+    recordAgentPhase('NOTIFY', 'USER_NOTIFIED', `Notified the reporting user that ${report.id} was resolved.`, { reportId: report.id, taskId: task.id });
+  }
   persistOperationalMemory();
+  return task;
+}
+
+function startResponseDemo(taskId, delayMs = Number(process.env.RESPONSE_DEMO_DELAY_MS) || 3000) {
+  const task = store.tasks.find(item => item.id === taskId);
+  if (!task) throw new Error('Collection task not found');
+  if (responseExecutions.has(taskId) || ['VERIFIED', 'CANCELLED'].includes(task.status)) return task;
+  responseExecutions.add(taskId);
+  const stages = ['DISPATCHED', 'DRIVER_EN_ROUTE', 'ARRIVED', 'COLLECTING'];
+  const advance = (index) => {
+    if (index < stages.length) {
+      try { if (task.status !== stages[index]) transitionTask(task, stages[index]); }
+      catch (error) { responseExecutions.delete(taskId); recordAgentPhase('MONITOR', 'DEMO_EXECUTION_FAILED', error.message, { taskId }); return; }
+      setTimeout(() => advance(index + 1), Math.max(250, delayMs));
+      return;
+    }
+    try {
+      const quantity = Math.max(1, Math.min(task.bins.reduce((sum, binId) => sum + (store.bins.find(item => item.id === binId)?.capacity || 240), 0), 100));
+      completeTask(taskId, { collectedQuantity: quantity, notes: 'Verified demo response execution.', contaminationLevel: 'MEDIUM' });
+    } catch (error) { recordAgentPhase('MONITOR', 'DEMO_EXECUTION_FAILED', error.message, { taskId }); }
+    responseExecutions.delete(taskId);
+  };
+  advance(0);
   return task;
 }
 
@@ -447,7 +760,7 @@ function authorizeRole(role, requiredRole) {
   return true;
 }
 
-function reportIncident({ location, wasteType, severity = 'MEDIUM', description, reporter = 'system@ecoflow.local' }) {
+function reportIncident({ location, wasteType, severity = 'MEDIUM', description, reporter = 'system@ecoflow.local', workspace = 'Hyderabad Operations' }) {
   const incident = {
     id: `INC-${Date.now()}`,
     location,
@@ -455,6 +768,7 @@ function reportIncident({ location, wasteType, severity = 'MEDIUM', description,
     severity,
     description,
     reporter,
+    workspace,
     status: 'OPEN',
     reportedAt: new Date().toISOString(),
     aiReview: null
@@ -492,27 +806,29 @@ function updateIncident(incidentId, status) {
   return incident;
 }
 
-function ensureActiveVehicle(vehicleId) {
+function ensureActiveVehicle(vehicleId, workspace = null) {
   const vehicle = store.vehicles.find(item => item.id === vehicleId);
   if (!vehicle) throw new Error(`Vehicle ${vehicleId} not found in Hyderabad fleet.`);
+  if (workspace && vehicle.workspace !== workspace) throw new Error('Vehicle is not in the selected workspace.');
   if (vehicle.status === 'MAINTENANCE' || vehicle.status === 'OFFLINE') throw new Error(`${vehicleId} is unavailable for dispatch.`);
   return vehicle;
 }
 
-function ensureBinIds(binIds = []) {
+function ensureBinIds(binIds = [], workspace = null) {
   const ids = Array.isArray(binIds) ? binIds : [binIds];
   const normalized = [...new Set(ids.filter(Boolean))];
   const bins = normalized.map(id => {
     const bin = store.bins.find(item => item.id === id);
-    if (!bin) throw new Error(`Bin ${id} not found in Hyderabad operations.`);
+    if (!bin || (workspace && bin.workspace !== workspace)) throw new Error(`Bin ${id} not found in the selected workspace.`);
     return bin;
   });
   return bins;
 }
 
-function ensureDriver(driverId) {
+function ensureDriver(driverId, workspace = null) {
   const driver = store.drivers.find(item => item.id === driverId);
   if (!driver) throw new Error(`Driver ${driverId} not found in Hyderabad roster.`);
+  if (workspace && driver.workspace !== workspace) throw new Error('Driver is not in the selected workspace.');
   return driver;
 }
 
@@ -520,12 +836,13 @@ function reassignTaskResources(taskId, { vehicleId, driverId } = {}) {
   const task = store.tasks.find(item => item.id === taskId);
   if (!task) throw new Error('Collection task not found');
   if (TERMINAL_TASK_STATUSES.has(task.status)) throw new Error('Terminal tasks cannot be reassigned.');
-  const vehicle = ensureActiveVehicle(vehicleId || task.vehicle);
-  const driver = ensureDriver(driverId || store.drivers.find(item => item.vehicleId === vehicle.id || item.name === vehicle.driver)?.id);
+  const workspace = task.workspace;
+  const vehicle = ensureActiveVehicle(vehicleId || task.vehicle, workspace);
+  const driver = ensureDriver(driverId || store.drivers.find(item => item.vehicleId === vehicle.id || item.name === vehicle.driver)?.id, workspace);
   if (driver.status !== 'ONLINE' && driver.id !== task.driverId) throw new Error(`${driver.id} is not available.`);
   if (driver.vehicleId && driver.vehicleId !== vehicle.id) throw new Error(`${driver.id} is not assigned to ${vehicle.id}.`);
   if (store.tasks.some(other => other.id !== task.id && !TERMINAL_TASK_STATUSES.has(other.status) && (other.vehicle === vehicle.id || other.driverId === driver.id))) throw new Error('Vehicle or driver already has an active collection task.');
-  const selectedBins = ensureBinIds(task.bins);
+  const selectedBins = ensureBinIds(task.bins, workspace);
   const route = optimizeRoute(selectedBins, { ...vehicle, currentLoad: 0 });
   if (route.sequence.length !== selectedBins.length) throw new Error(`${vehicle.id} cannot safely carry this task.`);
   const oldVehicle = store.vehicles.find(item => item.id === task.vehicle);
@@ -596,13 +913,17 @@ function maybeCallOpenAI(prompt, context = {}, history = []) {
   });
 }
 
-function executeToolAction(action) {
+function executeToolAction(action, user = { role: 'ADMIN' }) {
   const tool = String(action?.tool || action?.name || '').trim();
   const args = action?.args || {};
+  const workspace = user?.workspace || 'Hyderabad Operations';
+  if (new Set(['assign_vehicle', 'assign_driver', 'create_collection_task', 'notify_driver', 'notify_operator', 'write_audit_log']).has(tool) && !['ADMIN', 'OPERATOR'].includes(user.role)) {
+    throw new Error('Agent mutation requires an Admin or Operator role.');
+  }
 
   switch (tool) {
     case 'get_bin_status': {
-      return getBinStatus();
+      return getBinStatus(workspace);
     }
     case 'predict_overflow': {
       const bin = ensureBinIds([args.binId])[0];
@@ -610,19 +931,19 @@ function executeToolAction(action) {
       return { binId: bin.id, priority: priorityFor(bin, forecast), forecast, location: bin.location };
     }
     case 'prioritize_bins': {
-      const bins = ensureBinIds(args.binIds || []);
+      const bins = ensureBinIds(args.binIds || [], workspace);
       return bins.map(bin => {
         const forecast = predictedOverflow(bin);
         return { id: bin.id, location: bin.location, fill: bin.fill, priority: priorityFor(bin, forecast), forecast };
       }).sort((a, b) => (b.fill - a.fill) || (a.id.localeCompare(b.id)));
     }
     case 'get_available_vehicles': {
-      const bins = ensureBinIds(args.binIds || []);
+      const bins = ensureBinIds(args.binIds || [], workspace);
       return getAvailableVehiclesForBins(bins);
     }
     case 'check_vehicle_capacity': {
-      const vehicle = ensureActiveVehicle(args.vehicleId);
-      const bins = ensureBinIds(args.binIds || []);
+      const vehicle = ensureActiveVehicle(args.vehicleId, workspace);
+      const bins = ensureBinIds(args.binIds || [], workspace);
       const route = optimizeRoute(bins, { ...vehicle, currentLoad: vehicle.currentLoad || 0 });
       return { vehicleId: vehicle.id, capacity: vehicle.capacity, currentLoad: vehicle.currentLoad || 0, capacityRequired: route.capacityRequired, sufficient: route.sequence.length === bins.length };
     }
@@ -633,8 +954,8 @@ function executeToolAction(action) {
       return store.collectionHistory.slice(0, Math.max(1, Math.min(50, Number(args.limit) || 10)));
     }
     case 'optimize_route': {
-      const bins = ensureBinIds(args.binIds || []);
-      const vehicle = ensureActiveVehicle(args.vehicleId);
+      const bins = ensureBinIds(args.binIds || [], workspace);
+      const vehicle = ensureActiveVehicle(args.vehicleId, workspace);
       return optimizeRoute(bins, vehicle);
     }
     case 'assign_vehicle': {
@@ -646,15 +967,16 @@ function executeToolAction(action) {
       return { taskId: task.id, driverId: task.driverId, driverName: task.driver };
     }
     case 'create_collection_task': {
-      const bins = ensureBinIds(args.binIds || []);
-      const vehicle = ensureActiveVehicle(args.vehicleId);
+      const bins = ensureBinIds(args.binIds || [], workspace);
+      const vehicle = ensureActiveVehicle(args.vehicleId, workspace);
       const task = createCollectionTask({
         bins: bins.map(bin => bin.id),
         vehicleId: vehicle.id,
         source: 'AI',
         priority: String(args.priority || 'HIGH').toUpperCase(),
         reason: String(args.reason || 'AI generated collection task'),
-        assigneeId: args.assigneeId || null
+        assigneeId: args.assigneeId || null,
+        workspace
       });
       return task;
     }
@@ -743,7 +1065,7 @@ function conversationalFallback(prompt = '') {
   return null;
 }
 
-function localAnswer(prompt, bins, actions) {
+function localAnswer(prompt, bins, actions, workspace = 'Hyderabad Operations') {
   const normalized = prompt.trim().toLowerCase();
   const requestedBinId = prompt.match(/\b(?:hyg|b)-\d{3,}\b/i)?.[0]?.toUpperCase();
   const requestedBin = requestedBinId && bins.find(bin => bin.id === requestedBinId);
@@ -752,15 +1074,15 @@ function localAnswer(prompt, bins, actions) {
     return `${requestedBin.id} is ${requestedBin.priority} priority at ${requestedBin.fill}% fill in ${requestedBin.location}. Its predicted overflow is in ${requestedBin.forecast.hours} hours.`;
   }
   if (/(vehicle|fleet|truck|available)/.test(normalized)) {
-    const available = store.vehicles.filter(vehicle => vehicle.status === 'AVAILABLE');
-    const assigned = store.vehicles.filter(vehicle => ['ASSIGNED', 'EN_ROUTE', 'COLLECTING'].includes(vehicle.status));
+    const available = store.vehicles.filter(vehicle => vehicle.workspace === workspace && vehicle.status === 'AVAILABLE');
+    const assigned = store.vehicles.filter(vehicle => vehicle.workspace === workspace && ['ASSIGNED', 'EN_ROUTE', 'COLLECTING'].includes(vehicle.status));
     if (/status|current|fleet/.test(normalized)) {
       return `Hyderabad fleet status: ${available.length} available, ${assigned.length} assigned or in motion, ${store.vehicles.filter(vehicle => vehicle.status === 'MAINTENANCE').length} in maintenance. ${available.slice(0, 3).map(vehicle => `${vehicle.id} has ${Math.max(0, vehicle.capacity - vehicle.currentLoad)} kg remaining`).join('; ') || 'No vehicle is ready for dispatch.'}.`;
     }
     return available.length ? `${available.length} vehicles are available: ${available.map(vehicle => `${vehicle.id} (${vehicle.capacity - vehicle.currentLoad} kg remaining)`).join(', ')}.` : 'No vehicles are currently available.';
   }
   if (/(active|current|open|assigned).*(task|collection)|task|collection queue/.test(normalized)) {
-    const activeTasks = store.tasks.filter(task => !['COMPLETED', 'CANCELLED'].includes(task.status));
+    const activeTasks = store.tasks.filter(task => task.workspace === workspace && !['COMPLETED', 'CANCELLED'].includes(task.status));
     return activeTasks.length ? `${activeTasks.length} active collection tasks: ${activeTasks.slice(0, 5).map(task => `${task.id} (${task.status}, ${task.vehicle})`).join(', ')}.` : 'There are no active collection tasks.';
   }
   if (/(which|what|list|show|critical|urgent|attention|collection)/.test(normalized)) {
@@ -774,10 +1096,11 @@ function localAnswer(prompt, bins, actions) {
   return 'I can answer questions about bin status, overflow forecasts, available vehicles, routes, and collection tasks. Please include a bin ID for a precise forecast.';
 }
 
-function localAgentFallback(prompt = 'Run optimization', user = { role: 'ADMIN' }) {
+function localAgentFallback(prompt = 'Run optimization', user = { role: 'ADMIN', workspace: 'Hyderabad Operations' }) {
   const decisions = [];
   const actions = [];
-  const observed = getBinStatus().filter(bin => ['CRITICAL', 'HIGH', 'MEDIUM'].includes(bin.priority));
+  const workspace = user.workspace || 'Hyderabad Operations';
+  const observed = getBinStatus(workspace).filter(bin => ['CRITICAL', 'HIGH', 'MEDIUM'].includes(bin.priority));
   const conversationalAnswer = conversationalFallback(prompt);
 
   if (conversationalAnswer) {
@@ -829,7 +1152,7 @@ function localAgentFallback(prompt = 'Run optimization', user = { role: 'ADMIN' 
     urgent: observed.filter(bin => ['CRITICAL', 'HIGH'].includes(bin.priority)).length,
     decisions,
     actions,
-    answer: localAnswer(prompt, getBinStatus(), actions)
+    answer: localAnswer(prompt, getBinStatus(workspace), actions, workspace)
   };
   store.aiRuns.unshift(run);
   writeAgentAudit({ user, prompt, mode: run.mode, rationale: decisions[0]?.reason, tool: actions[0]?.type, result: actions[0] });
@@ -881,11 +1204,11 @@ async function runAgentLoop(options = {}) {
   const user = options.user || { role: 'ADMIN', workspace: 'Hyderabad Operations' };
   const startedAt = new Date().toISOString();
   const context = {
-    bins: getBinStatus(),
-    vehicles: store.vehicles,
-    drivers: store.drivers,
-    tasks: store.tasks,
-    incidents: store.incidents
+    bins: getBinStatus(user.workspace),
+    vehicles: store.vehicles.filter(item => item.workspace === user.workspace),
+    drivers: store.drivers.filter(item => item.workspace === user.workspace),
+    tasks: store.tasks.filter(item => item.workspace === user.workspace),
+    incidents: store.incidents.filter(item => item.workspace === user.workspace)
   };
 
   const defaultLocal = () => {
@@ -914,7 +1237,7 @@ async function runAgentLoop(options = {}) {
       if (parsed.tool === 'final') break;
       if (mutations.has(parsed.tool) && (!isMutationPrompt(prompt) || user.role === 'VIEWER')) throw new Error('LLM requested a mutation that is not authorized for this prompt or role.');
       let result;
-      try { result = executeToolAction(parsed); }
+      try { result = executeToolAction(parsed, user); }
       catch (error) {
         actions.push({ type: parsed.tool, status: 'REJECTED', result: error.message });
         history.push({ role: 'user', content: JSON.stringify({ toolResult: { tool: parsed.tool, rejected: true, error: error.message }, instruction: 'Use real IDs and a different safe action, or final.' }) });
@@ -943,7 +1266,7 @@ async function runAgentLoop(options = {}) {
   }
 }
 
-function runDeterministicOptimization(trigger = 'manual') {
+function runDeterministicOptimization(trigger = 'manual', workspace = 'Hyderabad Operations') {
   setAgentState('OBSERVING');
   syncVehicleAvailability();
   const startedAt = new Date().toISOString();
@@ -956,10 +1279,10 @@ function runDeterministicOptimization(trigger = 'manual') {
       .filter(task => !TERMINAL_TASK_STATUSES.has(task.status))
       .flatMap(task => task.bins || [])
   );
-  const observations = getBinStatus().filter(bin => !activeTaskBins.has(bin.id));
+  const observations = getBinStatus(workspace).filter(bin => !activeTaskBins.has(bin.id));
   setAgentState('ANALYZING');
   const urgent = observations.filter(bin => ['CRITICAL', 'HIGH'].includes(bin.priority)).sort((a, b) => (b.fill - a.fill) || (historicalCollectionScore(b) - historicalCollectionScore(a)));
-  const availableVehicles = store.vehicles.filter(vehicle => vehicle.status === 'AVAILABLE' && vehicle.status !== 'MAINTENANCE' && getAvailableDriver(vehicle));
+  const availableVehicles = store.vehicles.filter(vehicle => vehicle.workspace === workspace && vehicle.status === 'AVAILABLE' && vehicle.status !== 'MAINTENANCE' && getAvailableDriver(vehicle));
   const decisions = [];
   const actions = [];
 
@@ -975,6 +1298,7 @@ function runDeterministicOptimization(trigger = 'manual') {
       const task = createCollectionTask({
         bins: route.sequence,
         vehicleId: vehicle.id,
+        workspace,
         source: 'AI',
         priority: selected.some(bin => bin.priority === 'CRITICAL') ? 'CRITICAL' : 'HIGH',
         reason: `${selected[0].id} is predicted to overflow in ${selected[0].forecast.hours}h.`
@@ -1040,7 +1364,7 @@ async function runOptimization(trigger = 'manual', user = { role: 'ADMIN', works
     try { advisory = await runAgentLoop({ trigger, prompt: 'Execute the autonomous Hyderabad dispatch workflow: observe, analyze, check vehicle capacity and driver availability, optimize a validated route, dispatch if required, notify the driver, and finish with a concise result.', user, maxToolCalls: 10 }); }
     catch (_) { advisory = null; }
   }
-  const run = runDeterministicOptimization(trigger);
+  const run = runDeterministicOptimization(trigger, user.workspace || 'Hyderabad Operations');
   if (advisory) {
     run.mode = advisory.mode === 'LLM' ? 'LLM_WITH_VALIDATED_BACKEND_WORKFLOW' : 'LOCAL_RULE_ENGINE';
     run.advisoryToolCalls = advisory.toolCalls || advisory.actions?.length || 0;
@@ -1051,6 +1375,13 @@ async function runOptimization(trigger = 'manual', user = { role: 'ADMIN', works
 module.exports = {
   predictedOverflow,
   priorityFor,
+  computeFillFromUltrasonic,
+  handleTelemetry,
+  predictBinFill,
+  analyzePublicReportPhoto,
+  submitPublicReport,
+  findNearestBin,
+  fusePrioritySignals,
   getBinStatus,
   getWorkspaceBins,
   getAvailableVehiclesForBins,
@@ -1060,6 +1391,7 @@ module.exports = {
   createCollectionTask,
   transitionTask,
   completeTask,
+  startResponseDemo,
   authorizeRole,
   reportIncident,
   reviewIncident,
