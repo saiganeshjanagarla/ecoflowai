@@ -20,9 +20,8 @@ services:
       - key: CLIENT_ORIGIN
         value: https://ecoflow-web.onrender.com
 
-  - type: web
+  - type: static
     name: ecoflow-web
-    runtime: static
     rootDir: frontend
     buildCommand: npm install && npm run build
     staticPublishPath: dist
