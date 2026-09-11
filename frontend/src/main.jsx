@@ -10,7 +10,7 @@ import './visual-overrides.css';
 import './operations.css';
 import 'leaflet/dist/leaflet.css';
 
-const API = 'http://localhost:4000/api';
+const API = `${(import.meta.env.VITE_API_URL || 'http://localhost:4000').replace(/\/$/, '')}/api`;
 const SUPPORTED_WORKSPACES = ['Hyderabad Operations', 'Warangal Operations'];
 const CITY_CONFIG = {
   'Hyderabad Operations': { name: 'Hyderabad', latitude: 17.3850, longitude: 78.4867, zoom: 11 },

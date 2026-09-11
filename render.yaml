@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: ecoflow-api
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: node src/server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: AI_AUTOMATION_ENABLED
+        value: "false"
+      - key: AI_SIMULATED_TELEMETRY
+        value: "false"
+      - key: SENSOR_SIMULATOR_ENABLED
+        value: "false"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CLIENT_ORIGIN
+        value: https://ecoflow-web.onrender.com
+
+  - type: web
+    name: ecoflow-web
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        value: https://ecoflow-api.onrender.com
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
